@@ -39,6 +39,12 @@ transport.
 - [Real-device smoke testing](#real-device-smoke-testing)
 - [API documentation](#api-documentation)
 - [Installing and consuming wlonvif](#installing-and-consuming-wlonvif)
+- [Comparison to similar projects](#comparison-to-similar-projects)
+  - [Compared with gSOAP and generated ONVIF clients](#compared-with-gsoap-and-generated-onvif-clients)
+  - [Compared with Privatehive/libONVIF](#compared-with-privatehivelibonvif)
+  - [Compared with OnvifClient_gSOAP](#compared-with-onvifclient_gsoap)
+  - [Compared with onvif-qt-server-client](#compared-with-onvif-qt-server-client)
+  - [Compared with ONVIF-HTTP-code](#compared-with-onvif-http-code)
 - [Security and interoperability](#security-and-interoperability)
 
 ## Highlights
@@ -581,6 +587,209 @@ target_compile_features(camera_app PRIVATE cxx_std_20)
 ```
 
 Link `wlonvif::device` when the application also uses the virtual transport.
+
+## Comparison to similar projects
+
+There are several good ways to build ONVIF applications. The right choice depends
+on the implementation language, how much of the ONVIF specification is needed, and
+whether the project prefers generated schema bindings or a smaller curated API.
+
+The following comparison was reviewed on 2026-08-05 and is based on the projects'
+published documentation. It is not a conformance certification, security audit,
+maintenance assessment, popularity ranking, or performance benchmark. Feature
+support can change over time.
+
+| Project | Language and approach | Published scope | Discovery | Distinguishing trade-off |
+|---|---|---|---|---|
+| **wlonvif** | C++20; curated typed API with hand-maintained SOAP/XML handling | Device reads, Media1 profiles and URIs, normalized PTZ, PullPoint Events, endpoint policy, and virtual devices | Multicast, targeted unicast, CIDR probing, duplicate suppression, and bounded concurrency | Small native API, explicit deadlines/cancellation, bounded inputs, and deterministic tests; it intentionally covers fewer ONVIF operations than schema-generated libraries. |
+| [gSOAP](https://www.genivia.com/doc/guide/html/index.html) and generated ONVIF clients | C or C++; WSDL/XSD-to-code generation plus the gSOAP runtime | Potentially broad SOAP and ONVIF schema coverage determined by the imported WSDLs and plugins | WS-Discovery support is available through gSOAP tooling/plugins | Strong choice when broad, specification-shaped bindings or client/server generation matter; generated sources, the gSOAP runtime, and its GPLv2/commercial licensing choices add integration considerations. |
+| [Privatehive/libONVIF](https://github.com/Privatehive/libONVIF) | C++ with Qt-facing high-level classes that hide most gSOAP details | Publishes eleven client services, including Media1/Media2, Imaging, Analytics, Recording, Replay, and PTZ | Dedicated `OnvifDiscovery` class | Much broader advertised service surface and natural Qt/QML fit; requires the Qt/gSOAP ecosystem and uses GPL-3.0 rather than MIT. |
+| [OnvifClient_gSOAP](https://github.com/Allforgot/OnvifClient_gSOAP) | C++; ONVIF wrapper and examples built on generated gSOAP code | Its example demonstrates Device information, capabilities, Media, and PTZ operations | The repository describes remote discovery as unfinished | A concrete gSOAP-based starting point for C++ users, but its documented setup expects generated ONVIF code and exposes a less self-contained workflow than `wlonvif`. |
+| [onvif-qt-server-client](https://github.com/hummatli/onvif-qt-server-client) | Qt C++ sample using gSOAP-generated service structures | Advertises client and server libraries across Device, Events, Imaging, Media, PTZ, Recording, Replay, and other domains | Includes an ONVIF Discovery library and client/server discovery demonstration | Includes both client and server reference code; its documented environment is Qt 5.5, Visual Studio 2013, and 32-bit Windows, so current-toolchain portability requires separate assessment. |
+| [ONVIF-HTTP-code](https://github.com/fernandorpardo/ONVIF-HTTP-code) | C++; direct HTTP and XML implementation intended to show the protocol underneath | Partial implementation tested by its author with several TP-Link Tapo cameras, including PTZ examples | Not presented as a general robust discovery toolkit | Particularly useful as educational, readable protocol-level code and for its tested camera family; its own documentation explicitly says it is not comprehensive. |
+
+The sections below expand on the table. “Choose” means “is likely a better starting
+point,” not that one project is universally superior. Published service coverage is
+not the same as ONVIF conformance, and none of these comparisons replaces testing on
+the intended camera models and firmware.
+
+### Compared with gSOAP and generated ONVIF clients
+
+[gSOAP](https://www.genivia.com/doc/guide/html/index.html) is a general C/C++
+SOAP/XML toolkit rather than an ONVIF-only client. Its `wsdl2h` and `soapcpp2` tools
+turn WSDL and XSD definitions into C/C++ serializers, client stubs, and optional
+server skeletons. ONVIF projects built on gSOAP can therefore expose a much larger
+specification-shaped API than `wlonvif` without manually implementing every XML
+message.
+
+Key differences:
+
+- gSOAP favors generated types and operations that closely reflect the imported
+  schemas. `wlonvif` favors a smaller, hand-maintained API with normalized value
+  types and selected workflows.
+- gSOAP supports both client and server generation and a broad set of WS-* features.
+  `wlonvif` is primarily a client library; its virtual device is an in-process test
+  transport, not a general ONVIF network server.
+- A gSOAP application owns its WSDL import, code-generation, typemap, plugin, and
+  generated-source workflow. `wlonvif` builds directly from its checked-in source
+  using ordinary CMake dependencies.
+- `wlonvif` supplies project-specific limits, endpoint authorization, cold tasks,
+  cancellation/deadlines, direct-scan discovery, and a deterministic test backend.
+  Similar policies can be built around gSOAP, but they are application integration
+  choices rather than the main abstraction advertised by the toolkit.
+- gSOAP is offered as GPLv2 open source and under commercial licenses. `wlonvif` is
+  MIT-licensed. License compatibility may decide the choice before technical details
+  do.
+
+Choose gSOAP-generated bindings when broad WSDL coverage, native representation of
+many ONVIF request/response types, server generation, or advanced SOAP/WS-* tooling
+is important. Choose `wlonvif` when its narrower supported operations are sufficient
+and a compact C++20 API, bounded behavior, discovery fallbacks, and testability are
+more valuable than schema breadth. It is also reasonable to use gSOAP to explore
+less-common operations before deciding whether a smaller application-facing wrapper
+is worthwhile.
+
+### Compared with Privatehive/libONVIF
+
+[Privatehive/libONVIF](https://github.com/Privatehive/libONVIF) is one of the closest
+library-level alternatives to `wlonvif`. It wraps gSOAP in higher-level C++ and Qt
+classes, uses RAII request/response wrappers, and states that most of the library is
+thread-safe. Its documentation lists eleven client service domains: Analytics,
+Device, Display, Events, Imaging, Media1, Media2, PTZ, Receiver, Recording, and
+Replay. It also supplies dedicated Discovery and PullPoint helpers.
+
+Key differences:
+
+- libONVIF publishes a considerably broader ONVIF service surface. Applications
+  needing Media2, Imaging, Analytics, Recording, Replay, Receiver, or Display should
+  evaluate it before assuming those operations will be added to `wlonvif`.
+- libONVIF hides most gSOAP details but still builds around gSOAP-generated bindings
+  and Qt-oriented classes. `wlonvif` uses libcurl, libxml2, and OpenSSL directly and
+  does not require Qt or generated SOAP sources.
+- Qt/QML applications may benefit from libONVIF's design and its related ONVIFMonitor
+  example. `wlonvif` is UI-framework-neutral and may require an application-specific
+  adapter for Qt signals, objects, and event loops.
+- Both provide WS-Discovery and PullPoint support. `wlonvif` additionally documents
+  targeted unicast, bounded common-path HTTP probing, authorized CIDR scanning,
+  evidence merging, host/concurrency limits, and progress reporting.
+- `wlonvif` explicitly exposes deadlines, cancellation, endpoint authorization,
+  parser/queue bounds, and a programmable virtual transport. libONVIF instead
+  emphasizes service breadth, thread safety, RAII around gSOAP objects, and Qt
+  integration.
+- libONVIF is GPL-3.0. `wlonvif` is MIT. The application's distribution and linking
+  requirements may make this difference decisive; obtain appropriate legal advice
+  when license obligations are material.
+
+Choose libONVIF when its much broader service list, existing Qt/QML integration, or
+gSOAP-based operation model fits the application. Choose `wlonvif` when the required
+workflow fits its narrower surface and avoiding Qt/gSOAP, using an MIT-licensed
+dependency, explicit operation controls, robust direct-discovery fallbacks, or the
+virtual test backend matters more. Neither documentation set proves support on a
+particular device, so validate the exact methods and authentication behavior on the
+target firmware.
+
+### Compared with OnvifClient_gSOAP
+
+[OnvifClient_gSOAP](https://github.com/Allforgot/OnvifClient_gSOAP) is a concrete
+C++ ONVIF wrapper and sample project built on generated gSOAP code. Its published
+sample demonstrates Device information and capabilities together with Media and PTZ
+workflows, including AbsoluteMove and ContinuousMove. Absolute PTZ movement is a
+notable documented capability that `wlonvif` does not currently expose directly.
+
+Key differences:
+
+- OnvifClient_gSOAP exposes gSOAP-derived ONVIF bindings and expects gSOAP plus
+  generated ONVIF client code as prerequisites. `wlonvif` uses its own curated
+  service clients and does not require a SOAP code-generation step.
+- Its README instructs users to configure camera values in a sample header.
+  `wlonvif` examples use command-line, environment, protected-file, and interactive
+  credential sources so device-specific values need not be compiled into examples.
+- OnvifClient_gSOAP documents remote discovery as unfinished. `wlonvif` treats
+  discovery as a primary feature and combines multicast, targeted unicast, bounded
+  CIDR probing, and duplicate suppression.
+- `wlonvif` has a smaller PTZ surface today: relative and continuous movement,
+  status, Stop, presets, and preset navigation. OnvifClient_gSOAP may be a better
+  reference when direct AbsoluteMove behavior is required.
+
+Choose OnvifClient_gSOAP when an existing gSOAP toolchain is welcome, its binding
+style matches the application, or its demonstrated AbsoluteMove workflow is closer
+to the requirement. Choose `wlonvif` when self-contained CMake integration, robust
+discovery, runtime credential handling, explicit operation bounds, and the virtual
+test backend are higher priorities. Review both APIs against the exact required
+operations; neither project's README establishes complete ONVIF coverage.
+
+### Compared with onvif-qt-server-client
+
+[onvif-qt-server-client](https://github.com/hummatli/onvif-qt-server-client) is a Qt
+C++ and gSOAP sample containing ONVIF client code, server code, and generated service
+libraries. Its published structure covers a wide range of domains, including Device,
+Discovery, Events, Analytics, DeviceIO, Display, Imaging, Media, PTZ, Receiver,
+Recording Control/Search, and Replay. The included test workflow runs its ONVIF
+server and then uses its client to discover and call it.
+
+Key differences:
+
+- This project demonstrates both network client and network server roles. `wlonvif`
+  provides a network client and an in-process virtual test transport, but not a
+  general network-visible ONVIF server implementation.
+- Its broad library structure follows Qt and generated gSOAP services. `wlonvif`
+  offers fewer operations through smaller C++ value types and named service clients.
+- Its documented development environment is Qt 5.5, Visual Studio 2013, and 32-bit
+  Windows. That does not necessarily prevent porting, but consumers should budget
+  for modernization and verify current compilers, dependencies, and target platforms.
+- The project is Apache-2.0 licensed, while `wlonvif` is MIT-licensed. Both are
+  permissive licenses, but their notice and attribution terms differ.
+- `wlonvif` documents a standalone CMake package, cross-platform dependencies,
+  bounded network/parser behavior, endpoint policy, cancellation/deadlines, and
+  operational examples. onvif-qt-server-client provides something `wlonvif` does
+  not: source material for implementing and testing the server side of many ONVIF
+  domains.
+
+Choose onvif-qt-server-client when studying or prototyping both ends of ONVIF, when
+its generated server skeletons are needed, or when maintaining a compatible older Qt
+stack. Choose `wlonvif` for a current C++20 client-only integration with explicit
+runtime controls and no Qt/gSOAP dependency. For a new production server, treat the
+Qt project as reference material first and independently assess the modernization,
+security, conformance, and interoperability work required.
+
+### Compared with ONVIF-HTTP-code
+
+[ONVIF-HTTP-code](https://github.com/fernandorpardo/ONVIF-HTTP-code) deliberately
+works close to HTTP and XML so readers can see the protocol rather than delegate it
+to generated SOAP infrastructure. Its author describes it as partial and documents
+behavior observed on several TP-Link Tapo models. It includes particularly useful
+protocol explanations and Tapo-focused PTZ examples using RelativeMove and
+AbsoluteMove.
+
+Key differences:
+
+- Both projects avoid making generated WSDL bindings their public interface, but
+  ONVIF-HTTP-code emphasizes transparent, educational protocol code. `wlonvif`
+  emphasizes a reusable library API with structured results and hidden SOAP details.
+- ONVIF-HTTP-code documents real behavior on specific Tapo cameras and includes
+  AbsoluteMove. That focus can be more useful than a generic abstraction when those
+  devices are the deployment target.
+- `wlonvif` supplies asynchronous tasks, cancellation/deadlines, bounded parsers and
+  queues, endpoint policy, installable CMake targets, a virtual backend, and a larger
+  suite of standalone operational examples.
+- `wlonvif` provides multicast and direct-probe discovery as a library facility.
+  ONVIF-HTTP-code is not presented by its author as a general robust discovery
+  toolkit.
+- ONVIF-HTTP-code discusses push-event experiments and notes limitations in Renew
+  and Unsubscribe. `wlonvif` currently focuses on managed PullPoint event streams;
+  it does not provide a general notification web server.
+
+Choose ONVIF-HTTP-code to learn or debug the wire protocol, to build directly on its
+documented Tapo experiments, or when its AbsoluteMove implementation matches the
+need. Choose `wlonvif` for a more encapsulated application library, explicit
+resource-control primitives, reusable discovery, and hardware-independent tests.
+For difficult interoperability problems, reading ONVIF-HTTP-code alongside
+`wlonvif` traces can be useful even if it is not the final dependency.
+
+These projects can complement one another. A generated client or protocol-level
+reference is useful for investigating an operation that has not yet been added to
+`wlonvif`, while `wlonvif` can provide a smaller operational layer for the workflows
+it supports.
 
 ## Security and interoperability
 
