@@ -1,0 +1,8 @@
+name            wlonvif
+version         1.0.0
+description     Self contained c++ onvif library
+company         wheresjames
+author          Robert Umbehant
+email           wlonvif@wheresjames.com
+url             https://github.com/wheresjames/wlonvif
+license         MIT

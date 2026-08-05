@@ -1,0 +1,8 @@
+/.deps/
+/deps/
+/build/
+/build-*/
+_*
+WLO*
+crash-*
+

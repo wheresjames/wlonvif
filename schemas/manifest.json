@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "artifacts": [],
+  "policy": "Every upstream schema, generated artifact, and protocol fixture must record its source URL, retrieval date, version, license, SHA-256 hash, and redistribution decision before commit."
+}

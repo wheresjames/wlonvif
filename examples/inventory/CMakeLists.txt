@@ -1,0 +1,3 @@
+add_executable(wlonvif-inventory main.cpp)
+target_link_libraries(wlonvif-inventory PRIVATE wlonvif_example_support)
+wlonvif_apply_project_options(wlonvif-inventory)

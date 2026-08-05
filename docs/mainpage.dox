@@ -1,0 +1,71 @@
+/**
+ * @mainpage wlonvif C++ API
+ *
+ * `wlonvif` is a C++20 library for ONVIF Device, Media, PTZ, discovery, events,
+ * and deterministic virtual-device testing.
+ *
+ * @section getting_started Getting started
+ *
+ * Create a Runtime, transport, and endpoint policy, then consume the cold task
+ * returned by DeviceSession::connect(). Every asynchronous network operation takes
+ * CallOptions containing an absolute monotonic deadline and cancellation token.
+ *
+ * @code{.cpp}
+ * auto runtime_result = wlonvif::Runtime::create();
+ * if (!runtime_result) {
+ *     return 1;
+ * }
+ *
+ * auto runtime = runtime_result.value();
+ * auto transport = wlonvif::make_curl_transport(runtime);
+ * auto policy = wlonvif::make_same_origin_policy();
+ * @endcode
+ *
+ * @section components Components
+ *
+ * - DeviceSession exposes Device operations and service-specific clients.
+ * - MediaClient retrieves Media1 profiles and media URIs.
+ * - PtzClient controls movement, status, Stop, and presets.
+ * - DiscoverySession provides bounded discovery observations.
+ * - ManagedEventStream provides bounded events and continuity health signals.
+ * - VirtualDeviceTransport supplies deterministic test behavior.
+ *
+ * @section safety Safety model
+ *
+ * Inputs are bounded by XmlLimits, advertised endpoints require EndpointPolicy
+ * authorization, tasks complete once, and cancellation can report uncertain outcomes
+ * for operations that may already have reached a device.
+ *
+ * @section examples Real-device examples
+ *
+ * Build with `WLONVIF_BUILD_EXAMPLES=ON`. The suite includes robust discovery,
+ * read-only Device inspection, concurrent inventory, endpoint-policy evaluation,
+ * and a deterministic virtual-device workflow. Shared support supplies deadlines,
+ * JSON escaping, URL redaction, and password input that avoids process arguments.
+ * See `README.md` and `WLO-EXAMPLES.md` for usage and the implementation roadmap.
+ * Network Device sessions also provide Media1 profiles and URIs, normalized PTZ
+ * operations, and managed PullPoint Event streams. The media example can copy a
+ * bounded snapshot without decoding it; video playback remains delegated to an
+ * external RTSP player.
+ *
+ * The operational examples add aggregate camera health, bounded multi-camera
+ * inspection, optional inventory service columns, printable FFmpeg stream-copy
+ * commands, and explicitly confirmed preset tours. Discovery cannot guarantee that
+ * multicast-disabled devices will answer; RTSP playback/recording needs an external
+ * media stack; TLS certificate verification remains enabled; and vendor behavior can
+ * differ. Manual results belong in `docs/compatibility-matrix.md` while ordinary CI
+ * stays hardware-independent.
+ * Example credentials use command-line values first, then `WLONVIF_USERNAME` and
+ * `WLONVIF_PASSWORD`. Anonymous access is tried when neither is present; an HTTP or
+ * SOAP authentication failure on an interactive terminal triggers a username and
+ * no-echo password prompt followed by one retry. Command-line passwords may be
+ * exposed by shell history or process inspection, so environment, protected-file,
+ * or prompt input is preferable outside disposable tests.
+ * Real-device examples also accept `--ip ADDRESS`; shared support performs targeted
+ * library discovery to learn the Device service URL and nonstandard port. `--url`
+ * remains the mutually exclusive explicit override.
+ * PTZ keyboard mode provides WASD/cursor control, coalesces terminal key repeats,
+ * infers key release using a configurable movement lease, and provides a latched
+ * fallback mode. Its live ASCII position/status panel refreshes after each Stop,
+ * and error and exit paths independently attempt Stop.
+ */

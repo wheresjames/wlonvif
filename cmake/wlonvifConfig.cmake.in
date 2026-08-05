@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(CURL 8)
+find_dependency(LibXml2 2.9)
+find_dependency(OpenSSL 3 COMPONENTS Crypto)
+find_dependency(Threads)
+include("${CMAKE_CURRENT_LIST_DIR}/wlonvifTargets.cmake")
+set(wlonvif_core_FOUND TRUE)
+set(wlonvif_client_FOUND TRUE)
+set(wlonvif_device_FOUND TRUE)
+check_required_components(wlonvif)

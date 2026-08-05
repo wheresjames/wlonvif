@@ -1,0 +1,11 @@
+# https://editorconfig.org/
+# https://github.com/editorconfig/
+
+[*]
+indent_style = space
+indent_size = 4
+
+[.*]
+indent_style = space
+indent_size = 4
+
