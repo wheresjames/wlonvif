@@ -3,11 +3,33 @@
 #include <unordered_set>
 #include <wlonvif/wlonvif.hpp>
 #include "network_services.hpp"
+#include "ptz_safety.hpp"
 
 namespace wlonvif
 {
     namespace
     {
+        template <class T> T wait_task(Task<T> task)
+        {
+            struct WaitState
+            {
+                std::mutex mutex;
+                std::condition_variable ready;
+                std::optional<T> result;
+            };
+            auto state = std::make_shared<WaitState>();
+            std::move(task).start([state](T result)
+            {
+                {
+                    std::lock_guard lock(state->mutex);
+                    state->result.emplace(std::move(result));
+                }
+                state->ready.notify_one();
+            });
+            std::unique_lock lock(state->mutex);
+            state->ready.wait(lock, [&] { return state->result.has_value(); });
+            return std::move(*state->result);
+        }
         template <class T, class F>
         Task<Result<T>> async_call(
             std::shared_ptr<Runtime> runtime,
@@ -109,6 +131,261 @@ namespace wlonvif
         }
     } // namespace
 
+    Result<PullPointSubscriptionInfo>
+    ServiceBackend::create_event_subscription(std::chrono::seconds requested_lifetime)
+    {
+        auto pulled = pull_events(0);
+        if (!pulled) return pulled.error();
+        return PullPointSubscriptionInfo{
+            "legacy", {}, std::chrono::system_clock::now() + requested_lifetime
+        };
+    }
+    Result<std::vector<Event>> ServiceBackend::pull_event_subscription(
+        const std::string&, std::chrono::milliseconds, std::size_t maximum
+    )
+    {
+        return pull_events(maximum);
+    }
+    Result<PullPointSubscriptionInfo> ServiceBackend::renew_event_subscription(
+        const std::string& token, std::chrono::seconds requested_lifetime
+    )
+    {
+        auto renewed = renew_events();
+        if (!renewed) return renewed.error();
+        return PullPointSubscriptionInfo{
+            token, {}, std::chrono::system_clock::now() + requested_lifetime
+        };
+    }
+    Result<void> ServiceBackend::close_event_subscription(const std::string&)
+    {
+        return close_events();
+    }
+
+    struct PullPointSubscription::Impl
+    {
+        mutable std::mutex mutex;
+        std::mutex operation_mutex;
+        std::shared_ptr<Runtime> runtime;
+        std::shared_ptr<ServiceBackend> backend;
+        PullPointSubscriptionInfo information;
+        PullPointSubscriptionState state{PullPointSubscriptionState::open};
+        CancellationSource cancellation;
+    };
+
+    PullPointSubscription::PullPointSubscription(std::shared_ptr<Impl> impl)
+        : impl_(std::move(impl)) {}
+
+    PullPointSubscriptionInfo PullPointSubscription::info() const
+    {
+        std::lock_guard lock(impl_->mutex);
+        return impl_->information;
+    }
+
+    PullPointSubscriptionState PullPointSubscription::state() const noexcept
+    {
+        std::lock_guard lock(impl_->mutex);
+        return impl_->state;
+    }
+
+    Task<Result<std::vector<Event>>> PullPointSubscription::pull(
+        std::chrono::milliseconds server_timeout,
+        std::size_t maximum_messages,
+        CallOptions options
+    )
+    {
+        auto impl = impl_;
+        options.cancellation = CancellationToken::linked(
+            options.cancellation, impl->cancellation.token()
+        );
+        return async_call<std::vector<Event>>(
+            impl->runtime, options, OperationId::event_pull,
+            [impl, server_timeout, maximum_messages]
+            {
+                std::lock_guard operation_lock(impl->operation_mutex);
+                if (maximum_messages == 0)
+                    return Result<std::vector<Event>>(Error{
+                        ErrorCategory::invalid_argument,
+                        OperationId::event_pull,
+                        "maximum_messages must be positive"
+                    });
+                std::string token;
+                {
+                    std::lock_guard lock(impl->mutex);
+                    if (impl->state != PullPointSubscriptionState::open)
+                        return Result<std::vector<Event>>(Error{
+                            ErrorCategory::closed_handle, OperationId::event_pull,
+                            "subscription is closed"
+                        });
+                    token = impl->information.token;
+                }
+                return impl->backend->pull_event_subscription(
+                    token, server_timeout, maximum_messages
+                );
+            }
+        );
+    }
+
+    Task<Result<PullPointSubscriptionInfo>> PullPointSubscription::renew(
+        std::chrono::seconds requested_lifetime, CallOptions options
+    )
+    {
+        auto impl = impl_;
+        options.cancellation = CancellationToken::linked(
+            options.cancellation, impl->cancellation.token()
+        );
+        return async_call<PullPointSubscriptionInfo>(
+            impl->runtime, options, OperationId::event_renew,
+            [impl, requested_lifetime]
+            {
+                std::lock_guard operation_lock(impl->operation_mutex);
+                if (requested_lifetime <= std::chrono::seconds::zero())
+                    return Result<PullPointSubscriptionInfo>(Error{
+                        ErrorCategory::invalid_argument, OperationId::event_renew,
+                        "requested lifetime must be positive"
+                    });
+                std::string token;
+                {
+                    std::lock_guard lock(impl->mutex);
+                    if (impl->state != PullPointSubscriptionState::open)
+                        return Result<PullPointSubscriptionInfo>(Error{
+                            ErrorCategory::closed_handle, OperationId::event_renew,
+                            "subscription is closed"
+                        });
+                    token = impl->information.token;
+                }
+                auto renewed = impl->backend->renew_event_subscription(
+                    token, requested_lifetime
+                );
+                if (renewed)
+                {
+                    std::lock_guard lock(impl->mutex);
+                    impl->information = renewed.value();
+                }
+                return renewed;
+            }
+        );
+    }
+
+    Task<Result<void>> PullPointSubscription::unsubscribe(CallOptions options)
+    {
+        auto impl = impl_;
+        return async_call<void>(
+            impl->runtime, options, OperationId::event_close,
+            [impl]
+            {
+                std::lock_guard operation_lock(impl->operation_mutex);
+                std::string token;
+                {
+                    std::lock_guard lock(impl->mutex);
+                    if (impl->state == PullPointSubscriptionState::closed) return Result<void>{};
+                    if (impl->state == PullPointSubscriptionState::closing)
+                        return Result<void>(Error{
+                            ErrorCategory::closed_handle, OperationId::event_close,
+                            "subscription close is already in progress"
+                        });
+                    impl->state = PullPointSubscriptionState::closing;
+                    token = impl->information.token;
+                }
+                auto closed = impl->backend->close_event_subscription(token);
+                {
+                    std::lock_guard lock(impl->mutex);
+                    impl->state = closed ? PullPointSubscriptionState::closed
+                                         : PullPointSubscriptionState::open;
+                    if (closed) impl->cancellation.request_stop();
+                }
+                return closed;
+            }, false
+        );
+    }
+
+    Task<Result<CloseResult>> PullPointSubscription::close(
+        std::chrono::milliseconds cleanup_budget
+    )
+    {
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::max(cleanup_budget, std::chrono::milliseconds::zero());
+        auto source = CancellationSource{};
+        auto task = unsubscribe({deadline, source.token()});
+        return Task<Result<CloseResult>>(
+            [task = std::move(task)](auto done) mutable
+            {
+                std::move(task).start([done = std::move(done)](Result<void> result) mutable
+                {
+                    if (result) done(CloseResult{});
+                    else if (result.error().category == ErrorCategory::timeout)
+                        done(CloseResult{false, false});
+                    else done(result.error());
+                });
+            }
+        );
+    }
+
+    EventClient::EventClient(
+        std::shared_ptr<Runtime> runtime, std::shared_ptr<ServiceBackend> backend
+    ) : runtime_(std::move(runtime)), backend_(std::move(backend)) {}
+
+    Task<Result<std::shared_ptr<PullPointSubscription>>> EventClient::create_pullpoint(
+        PullPointSubscriptionOptions options, CallOptions call
+    )
+    {
+        auto runtime = runtime_;
+        auto backend = backend_;
+        return async_call<std::shared_ptr<PullPointSubscription>>(
+            runtime, call, OperationId::event_subscribe,
+            [runtime, backend, options]
+            {
+                if (options.requested_lifetime <= std::chrono::seconds::zero())
+                    return Result<std::shared_ptr<PullPointSubscription>>(Error{
+                        ErrorCategory::invalid_argument, OperationId::event_subscribe,
+                        "requested lifetime must be positive"
+                    });
+                auto created = backend->create_event_subscription(options.requested_lifetime);
+                if (!created)
+                    return Result<std::shared_ptr<PullPointSubscription>>(created.error());
+                auto impl = std::make_shared<PullPointSubscription::Impl>();
+                impl->runtime = runtime;
+                impl->backend = backend;
+                impl->information = std::move(created.value());
+                return Result<std::shared_ptr<PullPointSubscription>>(
+                    std::shared_ptr<PullPointSubscription>(new PullPointSubscription(impl))
+                );
+            }
+        );
+    }
+
+    Task<Result<std::shared_ptr<ManagedEventStream>>> EventClient::open_managed_stream(
+        ManagedEventOptions options, CallOptions call
+    )
+    {
+        auto runtime = runtime_;
+        auto backend = backend_;
+        auto created = create_pullpoint({options.requested_lifetime}, call);
+        return Task<Result<std::shared_ptr<ManagedEventStream>>>(
+            [runtime, backend, options, created = std::move(created)](auto done) mutable
+            {
+                std::move(created).start(
+                    [runtime, backend, options, done = std::move(done)](
+                        Result<std::shared_ptr<PullPointSubscription>> subscription
+                    ) mutable
+                    {
+                        if (!subscription) { done(subscription.error()); return; }
+                        try
+                        {
+                            done(std::shared_ptr<ManagedEventStream>(new ManagedEventStream(
+                                runtime, backend, std::move(subscription.value()), options
+                            )));
+                        }
+                        catch (const std::exception& error)
+                        {
+                            done(Error{ErrorCategory::internal, OperationId::event_subscribe,
+                                       error.what()});
+                        }
+                    }
+                );
+            }
+        );
+    }
+
     Result<double> normalize_ptz(double value, NativeRange range)
     {
         if (!std::isfinite(value) || !std::isfinite(range.minimum) ||
@@ -176,7 +453,15 @@ namespace wlonvif
     }
 
     PtzClient::PtzClient(std::shared_ptr<Runtime> r, std::shared_ptr<ServiceBackend> b)
-        : runtime_(std::move(r)), backend_(std::move(b))
+        : runtime_(std::move(r)), backend_(std::move(b)),
+          safety_(std::make_shared<PtzSafetyState>(backend_, CancellationSource{}.token()))
+    {
+    }
+    PtzClient::PtzClient(
+        std::shared_ptr<Runtime> r,
+        std::shared_ptr<ServiceBackend> b,
+        std::shared_ptr<PtzSafetyState> safety
+    ) : runtime_(std::move(r)), backend_(std::move(b)), safety_(std::move(safety))
     {
     }
     Task<Result<PtzSpaces>> PtzClient::spaces(ProfileToken t, CallOptions o)
@@ -195,19 +480,21 @@ namespace wlonvif
     Task<Result<PtzStatus>> PtzClient::status(ProfileToken t, CallOptions o)
     {
         auto b = backend_;
+        auto safety = safety_;
         return async_call<PtzStatus>(
             runtime_,
             o,
             OperationId::ptz_status,
-            [b, t = std::move(t)]
+            [b, safety, t = std::move(t)]
             {
-                return b->ptz_status(t);
+                return safety->status(t, [b, &t] { return b->ptz_status(t); });
             }
         );
     }
     static Task<Result<MoveResult>> move_call(
         std::shared_ptr<Runtime> r,
         std::shared_ptr<ServiceBackend> b,
+        std::shared_ptr<PtzSafetyState> safety,
         ProfileToken t,
         PtzVector v,
         bool relative,
@@ -218,7 +505,7 @@ namespace wlonvif
             std::move(r),
             o,
             relative ? OperationId::relative_move : OperationId::continuous_move,
-            [b, t = std::move(t), v, relative, o]() mutable
+            [b, safety, t = std::move(t), v, relative, o]() mutable
             {
                 if (!valid_ptz_vector(v))
                 {
@@ -228,49 +515,33 @@ namespace wlonvif
                         "PTZ components must be finite and between -1 and +1"
                     });
                 }
-                if (o.cancellation.stop_requested() ||
-                    std::chrono::steady_clock::now() >= o.deadline)
-                {
-                    set_network_call_options(safety_options(o));
-                    auto stopped = b->stop(t);
-                    set_network_call_options(o);
-                    Error e{
-                        o.cancellation.stop_requested() ? ErrorCategory::cancelled
-                                                        : ErrorCategory::timeout,
-                        relative ? OperationId::relative_move : OperationId::continuous_move,
-                        "movement cancelled",
-                        false,
-                        true
-                    };
-                    if (!stopped)
-                    {
-                        e.message += "; Stop failed: " + stopped.error().message;
-                    }
-                    return Result<MoveResult>(std::move(e));
-                }
-                return b->move(t, v, relative);
+                const auto operation = relative ? OperationId::relative_move
+                                                : OperationId::continuous_move;
+                return safety->move(t, operation, relative, o,
+                    [b, &t, v, relative] { return b->move(t, v, relative); });
             },
             false
         );
     }
     Task<Result<MoveResult>> PtzClient::continuous_move(ProfileToken t, PtzVector v, CallOptions o)
     {
-        return move_call(runtime_, backend_, std::move(t), v, false, o);
+        return move_call(runtime_, backend_, safety_, std::move(t), v, false, o);
     }
     Task<Result<MoveResult>> PtzClient::relative_move(ProfileToken t, PtzVector v, CallOptions o)
     {
-        return move_call(runtime_, backend_, std::move(t), v, true, o);
+        return move_call(runtime_, backend_, safety_, std::move(t), v, true, o);
     }
     Task<Result<MoveResult>> PtzClient::absolute_move(
         ProfileToken t, PtzVector position, std::optional<PtzVector> speed, CallOptions o
     )
     {
         auto b = backend_;
+        auto safety = safety_;
         return async_call<MoveResult>(
             runtime_,
             o,
             OperationId::absolute_move,
-            [b, t = std::move(t), position, speed]
+            [b, safety, t = std::move(t), position, speed, o]
             {
                 if (!valid_ptz_vector(position) || (speed && !valid_ptz_vector(*speed)))
                     return Result<MoveResult>(Error{
@@ -278,26 +549,28 @@ namespace wlonvif
                         OperationId::absolute_move,
                         "PTZ components must be finite and between -1 and +1"
                     });
-                return b->absolute_move(t, position, speed);
-            }
+                return safety->move(t, OperationId::absolute_move, true, o,
+                    [b, &t, position, speed] { return b->absolute_move(t, position, speed); });
+            },
+            false
         );
     }
     Task<Result<void>> PtzClient::stop(ProfileToken t, CallOptions o)
     {
-        auto b = backend_;
+        auto safety = safety_;
         return async_call<void>(
             runtime_,
             o,
             OperationId::ptz_stop,
-            [b, t = std::move(t)]
+            [safety, t = std::move(t), o]
             {
-                return b->stop(t);
+                return safety->stop(t, o);
             }
         );
     }
     Task<Result<void>> PtzClient::emergency_stop(ProfileToken t, CallOptions o)
     {
-        auto b = backend_;
+        auto safety = safety_;
         // A safety Stop has to reach the device even when the caller's token is
         // already cancelled or its deadline already passed. Skipping the precheck
         // is only half of that: the request itself must also travel under an
@@ -306,12 +579,9 @@ namespace wlonvif
             runtime_,
             o,
             OperationId::ptz_stop,
-            [b, t = std::move(t), o]
+            [safety, t = std::move(t), o]
             {
-                set_network_call_options(safety_options(o));
-                auto stopped = b->stop(t);
-                set_network_call_options(o);
-                return stopped;
+                return safety->stop(t, safety_options(o));
             },
             false
         );
@@ -332,14 +602,17 @@ namespace wlonvif
     Task<Result<void>> PtzClient::goto_preset(ProfileToken t, PresetToken p, CallOptions o)
     {
         auto b = backend_;
+        auto safety = safety_;
         return async_call<void>(
             runtime_,
             o,
             OperationId::goto_preset,
-            [b, t = std::move(t), p = std::move(p)]
+            [b, safety, t = std::move(t), p = std::move(p), o]
             {
-                return b->goto_preset(t, p);
-            }
+                return safety->preset(t, o,
+                    [b, &t, &p] { return b->goto_preset(t, p); });
+            },
+            false
         );
     }
 
@@ -454,9 +727,12 @@ namespace wlonvif
     struct ManagedEventStream::State
     {
         std::mutex mutex;
+        std::condition_variable changed;
         std::deque<EventOrHealth> queue;
         std::size_t maximum;
         bool closed{false};
+        bool automatic{false};
+        std::optional<Error> terminal_error;
 
         static bool is_loss_marker(const EventOrHealth& item)
         {
@@ -503,6 +779,123 @@ namespace wlonvif
     {
         state_->maximum = m;
     }
+    ManagedEventStream::ManagedEventStream(
+        std::shared_ptr<Runtime> r,
+        std::shared_ptr<ServiceBackend> b,
+        std::shared_ptr<PullPointSubscription> subscription,
+        ManagedEventOptions options
+    ) : state_(std::make_shared<State>()), runtime_(std::move(r)), backend_(std::move(b)),
+        subscription_(std::move(subscription)), managed_options_(options)
+    {
+        if (options.queue_capacity == 0 || options.pull_limit == 0 ||
+            options.pull_timeout <= std::chrono::milliseconds::zero() ||
+            options.minimum_backoff <= std::chrono::milliseconds::zero() ||
+            options.maximum_backoff < options.minimum_backoff ||
+            options.requested_lifetime <= std::chrono::seconds::zero())
+            throw std::invalid_argument("invalid managed Event options");
+        state_->maximum = options.queue_capacity;
+        state_->automatic = true;
+        managed_worker_ = std::thread([this] { run_managed(); });
+    }
+
+    ManagedEventStream::~ManagedEventStream()
+    {
+        managed_stop_.request_stop();
+        if (managed_worker_.joinable() && managed_worker_.get_id() != std::this_thread::get_id())
+            managed_worker_.join();
+    }
+
+    void ManagedEventStream::run_managed()
+    {
+        auto backoff = managed_options_.minimum_backoff;
+        bool reconnecting = false;
+        const auto interrupted_wait = [&](std::chrono::milliseconds duration)
+        {
+            const auto end = std::chrono::steady_clock::now() + duration;
+            while (!managed_stop_.token().stop_requested() &&
+                   std::chrono::steady_clock::now() < end)
+                std::this_thread::sleep_for(std::min(
+                    std::chrono::milliseconds(20),
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        end - std::chrono::steady_clock::now()
+                    )
+                ));
+        };
+        while (!managed_stop_.token().stop_requested())
+        {
+            auto current = subscription_;
+            const auto information = current->info();
+            const auto lifetime = managed_options_.requested_lifetime;
+            const auto margin = std::max(
+                std::chrono::seconds(5), lifetime / 5
+            );
+            if (std::chrono::system_clock::now() + margin >= information.termination_time)
+            {
+                auto renewed = wait_task(current->renew(
+                    lifetime,
+                    {std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                     managed_stop_.token()}
+                ));
+                if (!renewed && renewed.error().category != ErrorCategory::cancelled)
+                    reconnecting = true;
+            }
+            if (!reconnecting)
+            {
+                auto pulled = wait_task(current->pull(
+                    managed_options_.pull_timeout,
+                    managed_options_.pull_limit,
+                    {std::chrono::steady_clock::now() + managed_options_.pull_timeout +
+                         std::chrono::seconds(2), managed_stop_.token()}
+                ));
+                if (pulled)
+                {
+                    const bool empty = pulled.value().empty();
+                    {
+                        std::lock_guard lock(state_->mutex);
+                        for (auto& event : pulled.value()) state_->push(std::move(event));
+                    }
+                    state_->changed.notify_all();
+                    backoff = managed_options_.minimum_backoff;
+                    if (empty) interrupted_wait(std::chrono::milliseconds(20));
+                    continue;
+                }
+                if (pulled.error().category == ErrorCategory::cancelled) break;
+                if (!pulled.error().retryable &&
+                    pulled.error().category != ErrorCategory::network &&
+                    pulled.error().category != ErrorCategory::timeout)
+                {
+                    {
+                        std::lock_guard lock(state_->mutex);
+                        state_->terminal_error = pulled.error();
+                    }
+                    state_->changed.notify_all();
+                    break;
+                }
+                reconnecting = true;
+            }
+            interrupted_wait(backoff);
+            if (managed_stop_.token().stop_requested()) break;
+            EventClient events(runtime_, backend_);
+            auto replacement = wait_task(events.create_pullpoint(
+                {managed_options_.requested_lifetime},
+                {std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                 managed_stop_.token()}
+            ));
+            if (replacement)
+            {
+                subscription_ = std::move(replacement.value());
+                {
+                    std::lock_guard lock(state_->mutex);
+                    state_->push(StreamHealth::possible_event_loss);
+                }
+                state_->changed.notify_all();
+                reconnecting = false;
+                backoff = managed_options_.minimum_backoff;
+            }
+            else
+                backoff = std::min(managed_options_.maximum_backoff, backoff * 2);
+        }
+    }
     Task<Result<void>> ManagedEventStream::poll(std::size_t maximum, CallOptions o)
     {
         auto s = state_;
@@ -543,9 +936,17 @@ namespace wlonvif
             runtime_,
             o,
             OperationId::event_pull,
-            [s]
+            [s, o]
             {
-                std::lock_guard l(s->mutex);
+                std::unique_lock l(s->mutex);
+                if (s->automatic)
+                {
+                    while (s->queue.empty() && !s->closed && !s->terminal_error &&
+                           !o.cancellation.stop_requested() &&
+                           std::chrono::steady_clock::now() < o.deadline)
+                        s->changed.wait_until(l, o.deadline);
+                }
+                if (s->terminal_error) return Result<EventOrHealth>(*s->terminal_error);
                 if (s->queue.empty())
                 {
                     return Result<EventOrHealth>(Error{
@@ -583,6 +984,25 @@ namespace wlonvif
     }
     Task<Result<void>> ManagedEventStream::close(CallOptions o)
     {
+        if (subscription_)
+        {
+            auto self = shared_from_this();
+            return Task<Result<void>>([self = std::move(self), o](auto done) mutable
+            {
+                self->managed_stop_.request_stop();
+                if (self->managed_worker_.joinable() &&
+                    self->managed_worker_.get_id() != std::this_thread::get_id())
+                    self->managed_worker_.join();
+                auto closed = wait_task(self->subscription_->unsubscribe(o));
+                {
+                    std::lock_guard lock(self->state_->mutex);
+                    self->state_->closed = true;
+                    self->state_->queue.clear();
+                }
+                self->state_->changed.notify_all();
+                done(std::move(closed));
+            });
+        }
         auto s = state_;
         auto b = backend_;
         return async_call<void>(
@@ -595,6 +1015,7 @@ namespace wlonvif
                 std::lock_guard l(s->mutex);
                 s->closed = true;
                 s->queue.clear();
+                s->changed.notify_all();
                 return closed;
             }
         );

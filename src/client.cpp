@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
+#include <future>
 #include "dispatch.hpp"
 #include "network_services.hpp"
+#include "ptz_safety.hpp"
 #include "xml_scan.hpp"
 #include <wlonvif/wlonvif.hpp>
 
@@ -207,22 +209,35 @@ namespace wlonvif
                         }
                         if (response.value().status == 401)
                         {
-                            completion(Error{ErrorCategory::authentication, {}, "authentication failed"});
+                            Error error{ErrorCategory::authentication, {}, "authentication failed"};
+                            error.http = HttpErrorDetail{response.value().status};
+                            completion(std::move(error));
                             return;
                         }
                         if (response.value().status == 403)
                         {
-                            completion(Error{ErrorCategory::authorization, {}, "request was forbidden"});
+                            Error error{ErrorCategory::authorization, {}, "request was forbidden"};
+                            error.http = HttpErrorDetail{response.value().status};
+                            completion(std::move(error));
+                            return;
+                        }
+                        if (response.value().status == 429)
+                        {
+                            Error error{ErrorCategory::rate_limited, {}, "HTTP rate limit exceeded", true};
+                            error.http = HttpErrorDetail{response.value().status};
+                            completion(std::move(error));
                             return;
                         }
                         if (response.value().status < 200 || response.value().status >= 300)
                         {
-                            completion(Error{
+                            Error error{
                                 ErrorCategory::protocol_violation,
                                 {},
                                 "unexpected HTTP status " +
                                     std::to_string(response.value().status)
-                            });
+                            };
+                            error.http = HttpErrorDetail{response.value().status};
+                            completion(std::move(error));
                             return;
                         }
                         if (response.value().body.size() > maximum_bytes)
@@ -246,11 +261,18 @@ namespace wlonvif
         std::shared_ptr<HttpTransport> t,
         std::shared_ptr<EndpointPolicy> p,
         std::shared_ptr<Runtime> r,
-        std::optional<Credentials> c
+        std::shared_ptr<CredentialProvider> c
     )
         : url_(std::move(u)), transport_(std::move(t)), endpoint_policy_(std::move(p)),
-          runtime_(std::move(r)), credentials_(std::move(c))
+          runtime_(std::move(r)), credential_provider_(std::move(c))
     {
+    }
+    DeviceSession::~DeviceSession()
+    {
+        if (runtime_ && runtime_shutdown_registration_)
+            runtime_->unregister_shutdown_participant(runtime_shutdown_registration_);
+        session_cancellation_.request_stop();
+        if (credential_provider_) credential_provider_->close();
     }
     Task<Result<std::shared_ptr<DeviceSession>>> DeviceSession::connect(
         std::string u,
@@ -278,9 +300,19 @@ namespace wlonvif
                      options,
                      done = std::move(done)]() mutable
                 {
+                    if (u.empty() || !t || !p || !r)
+                    {
+                        done(Error{ErrorCategory::invalid_argument, {}, "incomplete session options"});
+                        return;
+                    }
                     if (options.cancellation.stop_requested())
                     {
                         done(Error{ErrorCategory::cancelled});
+                        return;
+                    }
+                    if (std::chrono::steady_clock::now() >= options.deadline)
+                    {
+                        done(Error{ErrorCategory::timeout});
                         return;
                     }
                     auto a = p->authorize(u, origin(u));
@@ -289,16 +321,166 @@ namespace wlonvif
                         done(a.error());
                         return;
                     }
-                    done(
-                        std::shared_ptr<DeviceSession>(new DeviceSession(
-                            std::move(u), std::move(t), std::move(p), std::move(r), std::move(c)
-                        ))
-                    );
+                    auto provider = c ? make_fixed_credential_provider(std::move(*c)) : nullptr;
+                    auto session = std::shared_ptr<DeviceSession>(new DeviceSession(
+                        std::move(u), std::move(t), std::move(p), std::move(r), std::move(provider)
+                    ));
+                    session->register_runtime_shutdown();
+                    done(std::move(session));
                 };
                 auto runtime = r;
                 detail::dispatch(runtime, std::move(work));
             }
         );
+    }
+    Task<Result<std::shared_ptr<DeviceSession>>> DeviceSession::connect(DeviceSessionOptions options)
+    {
+        return Task<Result<std::shared_ptr<DeviceSession>>>(
+            [options = std::move(options)](auto done) mutable
+            {
+                if (options.device_url.empty() || !options.transport || !options.endpoint_policy ||
+                    !options.runtime)
+                {
+                    done(Error{ErrorCategory::invalid_argument, {}, "incomplete session options"});
+                    return;
+                }
+                if (options.call.cancellation.stop_requested())
+                {
+                    done(Error{ErrorCategory::cancelled});
+                    return;
+                }
+                if (std::chrono::steady_clock::now() >= options.call.deadline)
+                {
+                    done(Error{ErrorCategory::timeout});
+                    return;
+                }
+                auto authorized = options.endpoint_policy->authorize(
+                    options.device_url, origin(options.device_url)
+                );
+                if (!authorized) { done(authorized.error()); return; }
+                auto session = std::shared_ptr<DeviceSession>(new DeviceSession(
+                    std::move(options.device_url), std::move(options.transport),
+                    std::move(options.endpoint_policy), std::move(options.runtime),
+                    std::move(options.credential_provider)
+                ));
+                session->register_runtime_shutdown();
+                done(std::move(session));
+            }
+        );
+    }
+    void DeviceSession::register_runtime_shutdown()
+    {
+        std::weak_ptr<DeviceSession> weak = shared_from_this();
+        runtime_shutdown_registration_ = runtime_->register_shutdown_participant([weak]
+        {
+            if (auto session = weak.lock()) session->shutdown_from_runtime();
+        });
+    }
+    void DeviceSession::shutdown_from_runtime() noexcept
+    {
+        try
+        {
+            auto promise = std::make_shared<std::promise<Result<CloseResult>>>();
+            auto future = promise->get_future();
+            std::move(close(std::chrono::seconds(5))).start(
+                [promise](Result<CloseResult> result) { promise->set_value(std::move(result)); }
+            );
+            (void)future.wait_for(std::chrono::seconds(6));
+        }
+        catch (...) {}
+    }
+    bool DeviceSession::is_closed() const noexcept
+    {
+        std::lock_guard lock(state_mutex_);
+        return state_ != State::open;
+    }
+    Task<Result<CloseResult>> DeviceSession::close(std::chrono::milliseconds cleanup_budget)
+    {
+        return Task<Result<CloseResult>>(
+            [self = shared_from_this(), cleanup_budget](auto done) mutable
+            {
+                std::shared_ptr<PtzSafetyState> safety_candidate;
+                {
+                    std::lock_guard lock(self->backend_mutex_);
+                    safety_candidate = self->ptz_safety_;
+                }
+                auto completed = std::make_shared<std::atomic_bool>(false);
+                auto terminal = [done = std::move(done), completed](Result<CloseResult> result) mutable
+                {
+                    if (!completed->exchange(true)) done(std::move(result));
+                };
+                bool immediate = false;
+                bool run_safety = false;
+                bool close_credentials = false;
+                {
+                    std::lock_guard lock(self->state_mutex_);
+                    if (self->state_ == State::closed) immediate = true;
+                    if (self->state_ == State::open)
+                    {
+                        self->state_ = State::closing;
+                        self->session_cancellation_.request_stop();
+                        close_credentials = static_cast<bool>(self->credential_provider_);
+                        if (safety_candidate)
+                        {
+                            ++self->active_operations_;
+                            self->close_safety_complete_ = false;
+                            run_safety = true;
+                        }
+                    }
+                    if (self->active_operations_ == 0)
+                    {
+                        self->state_ = State::closed;
+                        immediate = true;
+                    }
+                    if (!immediate) self->close_waiters_.push_back(terminal);
+                }
+                // CredentialProvider is an extension point and may synchronously
+                // complete pending acquisitions from close(). Never call it while
+                // holding state_mutex_, because those completions finish operations
+                // by acquiring the same mutex.
+                if (close_credentials) self->credential_provider_->close();
+                if (run_safety)
+                {
+                    auto safety = std::move(safety_candidate);
+                    std::thread([self, safety]() mutable
+                    {
+                        const bool complete = safety->close_all(
+                            std::chrono::steady_clock::now() + std::chrono::seconds(5)
+                        );
+                        {
+                            std::lock_guard lock(self->state_mutex_);
+                            self->close_safety_complete_ = complete;
+                        }
+                        self->operation_finished();
+                    }).detach();
+                }
+                if (immediate) { terminal(CloseResult{true, self->close_safety_complete_}); return; }
+                if (cleanup_budget <= std::chrono::milliseconds::zero())
+                {
+                    terminal(CloseResult{false, false});
+                    return;
+                }
+                std::thread([terminal = std::move(terminal), cleanup_budget]() mutable
+                {
+                    std::this_thread::sleep_for(cleanup_budget);
+                    terminal(CloseResult{false, false});
+                }).detach();
+            }
+        );
+    }
+    void DeviceSession::operation_finished() noexcept
+    {
+        std::vector<std::function<void(Result<CloseResult>)>> waiters;
+        {
+            std::lock_guard lock(state_mutex_);
+            if (active_operations_ != 0) --active_operations_;
+            if (state_ == State::closing && active_operations_ == 0)
+            {
+                state_ = State::closed;
+                waiters.swap(close_waiters_);
+            }
+        }
+        for (auto& waiter : waiters) waiter(CloseResult{true, close_safety_complete_});
     }
     Task<Result<std::string>>
     DeviceSession::invoke(OperationId op, std::string_view response, CallOptions options)
@@ -309,28 +491,50 @@ namespace wlonvif
              response = std::string(response),
              options](auto done) mutable
             {
-                std::string envelope;
-                try
                 {
-                    // Envelope construction can fail when the CSPRNG backing the
-                    // WS-Security nonce is unavailable, so it belongs inside the
-                    // operation where the failure has an Error to travel in.
-                    envelope = soap_envelope(op, "", self->credentials_);
+                    std::lock_guard lock(self->state_mutex_);
+                    if (self->state_ != State::open)
+                    {
+                        done(Error{ErrorCategory::closed_handle, op, "session is closed"});
+                        return;
+                    }
+                    ++self->active_operations_;
                 }
-                catch (const std::exception& error)
+                auto caller_done = std::move(done);
+                auto settled = std::make_shared<std::atomic_bool>(false);
+                done = [self, caller_done = std::move(caller_done), settled](Result<std::string> result) mutable
                 {
-                    done(Error{ErrorCategory::internal, op, error.what()});
-                    return;
-                }
-                HttpRequest q{
+                    if (settled->exchange(true)) return;
+                    self->operation_finished();
+                    caller_done(std::move(result));
+                };
+                auto linked = CancellationToken::linked(
+                    options.cancellation, self->session_cancellation_.token()
+                );
+                auto send_with = [self, op, response = std::move(response), options, linked,
+                                  done = std::move(done)](
+                                     Result<std::shared_ptr<CredentialLease>> acquired
+                                  ) mutable
+                {
+                    if (!acquired) { auto error = acquired.error(); error.operation = op; done(std::move(error)); return; }
+                    auto lease = std::move(acquired.value());
+                    std::string envelope;
+                    try { envelope = soap_envelope(op, "", lease.get()); }
+                    catch (const std::exception& error)
+                    { done(Error{ErrorCategory::internal, op, error.what()}); return; }
+                    HttpRequest q{
                     self->url_,
                     std::move(envelope),
                     {"Content-Type: application/soap+xml; charset=utf-8"},
-                    options.deadline,
-                    self->credentials_
-                };
-                auto source = self->transport_->send(std::move(q), options.cancellation);
-                std::move(source).start(
+                    options.deadline
+                    };
+                    q.credential_lease = std::move(lease);
+                    q.original_url = self->url_;
+                    q.operation = op;
+                    q.idempotent = true;
+                    q.retry_allowed = false;
+                    auto source = self->transport_->send(std::move(q), linked);
+                    std::move(source).start(
                     [response = std::move(response),
                      op,
                      done = std::move(done)](Result<HttpResponse> r) mutable
@@ -344,12 +548,23 @@ namespace wlonvif
                         }
                         if (r.value().status == 401)
                         {
-                            done(Error{ErrorCategory::authentication, op, "authentication failed"});
+                            Error error{ErrorCategory::authentication, op, "authentication failed"};
+                            error.http = HttpErrorDetail{r.value().status};
+                            done(std::move(error));
                             return;
                         }
                         if (r.value().status == 403)
                         {
-                            done(Error{ErrorCategory::authorization, op, "request was forbidden"});
+                            Error error{ErrorCategory::authorization, op, "request was forbidden"};
+                            error.http = HttpErrorDetail{r.value().status};
+                            done(std::move(error));
+                            return;
+                        }
+                        if (r.value().status == 429)
+                        {
+                            Error error{ErrorCategory::rate_limited, op, "HTTP rate limit exceeded", true};
+                            error.http = HttpErrorDetail{r.value().status};
+                            done(std::move(error));
                             return;
                         }
                         if (r.value().status < 200 || r.value().status >= 300)
@@ -363,14 +578,14 @@ namespace wlonvif
                                 done(std::move(error));
                                 return;
                             }
-                            done(
-                                Error{
+                            Error error{
                                     ErrorCategory::protocol_violation,
                                     op,
                                     "unexpected HTTP status " +
                                         std::to_string(r.value().status)
-                                }
-                            );
+                            };
+                            error.http = HttpErrorDetail{r.value().status};
+                            done(std::move(error));
                             return;
                         }
                         auto parsed = read_soap_operation(r.value().body, response);
@@ -396,6 +611,20 @@ namespace wlonvif
                             return;
                         }
                         done(std::string(detail_xml::inner(r.value().body, *element)));
+                    }
+                    );
+                };
+                if (!self->credential_provider_)
+                {
+                    send_with(std::shared_ptr<CredentialLease>{});
+                    return;
+                }
+                auto acquisition = self->credential_provider_->acquire({options.deadline, linked});
+                std::move(acquisition).start(
+                    [send_with = std::move(send_with)](Result<CredentialLease> result) mutable
+                    {
+                        if (!result) { send_with(result.error()); return; }
+                        send_with(std::make_shared<CredentialLease>(std::move(result.value())));
                     }
                 );
             }
@@ -556,21 +785,48 @@ namespace wlonvif
         if (!backend_)
         {
             backend_ = make_network_service_backend(
-                url_, transport_, endpoint_policy_, runtime_, credentials_
+                url_, transport_, endpoint_policy_, runtime_, credential_provider_,
+                session_cancellation_.token()
             );
         }
         return backend_;
     }
     Result<std::shared_ptr<MediaClient>> DeviceSession::media()
     {
+        if (is_closed()) return Error{ErrorCategory::closed_handle, {}, "session is closed"};
         return std::make_shared<MediaClient>(runtime_, backend());
     }
     Result<std::shared_ptr<PtzClient>> DeviceSession::ptz()
     {
-        return std::make_shared<PtzClient>(runtime_, backend());
+        if (is_closed()) return Error{ErrorCategory::closed_handle, {}, "session is closed"};
+        return std::shared_ptr<PtzClient>(new PtzClient(runtime_, backend(), ptz_safety()));
+    }
+    Result<std::shared_ptr<EventClient>> DeviceSession::event_client()
+    {
+        if (is_closed()) return Error{ErrorCategory::closed_handle, {}, "session is closed"};
+        return std::make_shared<EventClient>(runtime_, backend());
+    }
+    std::shared_ptr<PtzSafetyState> DeviceSession::ptz_safety()
+    {
+        std::lock_guard lock(backend_mutex_);
+        if (!backend_)
+        {
+            backend_ = std::dynamic_pointer_cast<ServiceBackend>(transport_);
+            if (!backend_)
+                backend_ = make_network_service_backend(
+                    url_, transport_, endpoint_policy_, runtime_, credential_provider_,
+                    session_cancellation_.token()
+                );
+        }
+        if (!ptz_safety_)
+            ptz_safety_ = std::make_shared<PtzSafetyState>(
+                backend_, session_cancellation_.token()
+            );
+        return ptz_safety_;
     }
     Result<std::shared_ptr<ManagedEventStream>> DeviceSession::events(std::size_t maximum)
     {
+        if (is_closed()) return Error{ErrorCategory::closed_handle, {}, "session is closed"};
         return std::make_shared<ManagedEventStream>(runtime_, backend(), maximum);
     }
 } // namespace wlonvif

@@ -131,4 +131,18 @@ namespace wlonvif
                std::string(operation.prefix) + ':' + std::string(operation.name) +
                "></s:Body></s:Envelope>";
     }
+    std::string soap_envelope(
+        OperationId operation, std::string_view body, const CredentialLease* credentials
+    )
+    {
+        if (!credentials) return soap_envelope(operation, body, std::optional<Credentials>{});
+        Credentials materialized{
+            std::string(credentials->username()), std::string(credentials->password()),
+            credentials->allow_cleartext_basic()
+        };
+        auto envelope = soap_envelope(operation, body, std::optional<Credentials>{materialized});
+        OPENSSL_cleanse(materialized.username.data(), materialized.username.size());
+        OPENSSL_cleanse(materialized.password.data(), materialized.password.size());
+        return envelope;
+    }
 } // namespace wlonvif

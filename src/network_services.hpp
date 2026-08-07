@@ -12,6 +12,7 @@ namespace wlonvif
         std::shared_ptr<HttpTransport> transport,
         std::shared_ptr<EndpointPolicy> endpoint_policy,
         std::shared_ptr<Runtime> runtime,
-        std::optional<Credentials> credentials
+        std::shared_ptr<CredentialProvider> credential_provider,
+        CancellationToken session_cancellation
     );
 }

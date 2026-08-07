@@ -54,6 +54,18 @@ if(WLONVIF_BUILD_TESTING)
   add_test(NAME http_authentication COMMAND wlonvif_http_auth_tests)
   set_tests_properties(http_authentication PROPERTIES TIMEOUT 60)
 
+  add_executable(wlonvif_session_security_tests
+    ${PROJECT_SOURCE_DIR}/tests/session_security_tests.cpp)
+  target_link_libraries(wlonvif_session_security_tests PRIVATE wlonvif::client)
+  add_test(NAME session_security COMMAND wlonvif_session_security_tests)
+  set_tests_properties(session_security PROPERTIES TIMEOUT 15)
+
+  add_executable(wlonvif_ptz_safety_tests
+    ${PROJECT_SOURCE_DIR}/tests/ptz_safety_tests.cpp)
+  target_link_libraries(wlonvif_ptz_safety_tests PRIVATE wlonvif::device)
+  add_test(NAME ptz_safety COMMAND wlonvif_ptz_safety_tests)
+  set_tests_properties(ptz_safety PROPERTIES TIMEOUT 20)
+
   foreach(target IN ITEMS
       wlonvif_device_tests
       wlonvif_service_tests
@@ -61,7 +73,9 @@ if(WLONVIF_BUILD_TESTING)
       wlonvif_regression_tests
       wlonvif_ptz_controller_tests
       wlonvif_ptz_viewport_tests
-      wlonvif_http_auth_tests)
+      wlonvif_http_auth_tests
+      wlonvif_session_security_tests
+      wlonvif_ptz_safety_tests)
     wlonvif_apply_project_options(${target})
   endforeach()
 endif()

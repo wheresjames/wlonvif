@@ -180,7 +180,7 @@ int main()
     VERIFY(native && std::abs(native.value() - 1) < 1e-12);
     VERIFY(!normalize_ptz(0, {1, 1}));
     auto moved = wait2(ptz.value()->continuous_move("main", {0.5, -0.25, {}}, o));
-    VERIFY(moved && moved.value().request_may_have_been_applied);
+    VERIFY(moved && !moved.value().request_may_have_been_applied);
     auto status = wait2(ptz.value()->status("main", o));
     VERIFY(status && status.value().moving && status.value().position.pan == 0.5);
     VERIFY(wait2(ptz.value()->stop("main", o)));
@@ -226,6 +226,37 @@ int main()
     auto health = wait2(stream.value()->next(o));
     VERIFY(health);
     VERIFY(wait2(stream.value()->close(o)));
+
+    // Explicit PullPoint lifecycle exposes independent handle state and timing.
+    auto event_client = session->event_client();
+    VERIFY(event_client);
+    auto subscription = wait2(event_client.value()->create_pullpoint({}, o));
+    VERIFY(subscription);
+    VERIFY(subscription.value()->state() == PullPointSubscriptionState::open);
+    VERIFY(!subscription.value()->info().token.empty());
+    device->emit({"tns1:Explicit", std::chrono::system_clock::now(), "cam", "true", 4});
+    auto explicit_events = wait2(subscription.value()->pull(
+        std::chrono::milliseconds(100), 4, o
+    ));
+    VERIFY(explicit_events && explicit_events.value().size() == 1);
+    auto renewed = wait2(subscription.value()->renew(std::chrono::seconds(30), o));
+    VERIFY(renewed);
+    VERIFY(wait2(subscription.value()->unsubscribe(o)));
+    VERIFY(subscription.value()->state() == PullPointSubscriptionState::closed);
+    VERIFY(!wait2(subscription.value()->pull(std::chrono::milliseconds(100), 1, o)));
+
+    // Automatic streams pull in the background and next() waits for data.
+    ManagedEventOptions managed_options;
+    managed_options.pull_timeout = std::chrono::milliseconds(50);
+    managed_options.minimum_backoff = std::chrono::milliseconds(10);
+    managed_options.maximum_backoff = std::chrono::milliseconds(40);
+    auto automatic = wait2(event_client.value()->open_managed_stream(managed_options, o));
+    VERIFY(automatic);
+    device->emit({"tns1:Automatic", std::chrono::system_clock::now(), "cam", "true", 5});
+    auto automatic_event = wait2(automatic.value()->next(o));
+    VERIFY(automatic_event && std::holds_alternative<Event>(automatic_event.value()));
+    VERIFY(wait2(automatic.value()->close(o)));
+    VERIFY(library_features().pullpoint_subscription);
 
     auto network_transport = std::make_shared<NetworkFixtureTransport>();
     auto network_session = wait2(DeviceSession::connect(

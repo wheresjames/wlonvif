@@ -98,8 +98,24 @@ int main()
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     CHECK(commands == 1);
     CHECK(disconnects == 1);
+    websocket::stream<tcp::socket> idle_ws(io);
+    idle_ws.next_layer().connect({asio::ip::make_address("127.0.0.1"), config.port});
+    idle_ws.set_option(websocket::stream_base::decorator([&](websocket::request_type& request)
+    {
+        request.set(http::field::origin, config.protocol.allowed_origins.front());
+        request.set(http::field::cookie, cookie);
+    }));
+    idle_ws.handshake("127.0.0.1", "/control");
+    // A client may connect and then send no HTTP bytes. Shutdown must interrupt
+    // the worker's synchronous header read instead of joining it forever.
+    tcp::socket idle_socket(io);
+    idle_socket.connect({asio::ip::make_address("127.0.0.1"), config.port});
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     stop.store(true);
     thread.join();
+    idle_socket.close();
+    beast::error_code ignored;
+    idle_ws.next_layer().close(ignored);
     CHECK(server_result);
     std::cout << "PTZ web server tests passed\n";
 }

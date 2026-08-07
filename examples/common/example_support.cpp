@@ -344,6 +344,27 @@ namespace wlonvif::examples
         };
     }
 
+    bool shutdown_requested()
+    {
+        return signal_cancellation().source.token().stop_requested();
+    }
+
+    bool interruptible_wait(std::chrono::milliseconds duration)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (shutdown_requested()) return false;
+            std::this_thread::sleep_for(std::min(
+                std::chrono::milliseconds(20),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now()
+                )
+            ));
+        }
+        return !shutdown_requested();
+    }
+
     Result<std::shared_ptr<DeviceSession>> connect_device(
         std::string url,
         const std::shared_ptr<Runtime>& runtime,
@@ -647,12 +668,16 @@ namespace wlonvif::examples
             case ErrorCategory::tls: return "tls";
             case ErrorCategory::authentication: return "authentication";
             case ErrorCategory::authorization: return "authorization";
+            case ErrorCategory::device_busy: return "device-busy";
+            case ErrorCategory::rate_limited: return "rate-limited";
             case ErrorCategory::malformed_http: return "malformed-http";
             case ErrorCategory::malformed_xml: return "malformed-xml";
             case ErrorCategory::soap_fault: return "soap-fault";
             case ErrorCategory::unsupported: return "unsupported";
             case ErrorCategory::invalid_argument: return "invalid-argument";
             case ErrorCategory::endpoint_rejected: return "endpoint-rejected";
+            case ErrorCategory::host_permission_denied: return "host-permission-denied";
+            case ErrorCategory::closed_handle: return "closed-handle";
             case ErrorCategory::protocol_violation: return "protocol-violation";
             case ErrorCategory::closed: return "closed";
             case ErrorCategory::queue_overflow: return "queue-overflow";

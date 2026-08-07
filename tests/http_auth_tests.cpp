@@ -65,7 +65,8 @@ namespace
     {
         none,   ///< Always 200; never asks for HTTP authentication.
         digest, ///< 401 with a Digest challenge, then 200 once authenticated.
-        basic   ///< 401 with a Basic challenge, then 200 once authenticated.
+        basic,  ///< 401 with a Basic challenge, then 200 once authenticated.
+        bearer_basic_realm ///< "basic" occurs in a parameter, not as a scheme.
     };
 
     /**
@@ -198,11 +199,12 @@ namespace
             std::string response;
             if (wants_challenge)
             {
-                const std::string header =
-                    challenge_ == Challenge::digest
+                const std::string header = challenge_ == Challenge::digest
                         ? "WWW-Authenticate: Digest realm=\"wlonvif\", qop=\"auth\", "
                           "nonce=\"4f1a9c8b2d\", opaque=\"7c3\"\r\n"
-                        : "WWW-Authenticate: Basic realm=\"wlonvif\"\r\n";
+                        : challenge_ == Challenge::basic
+                            ? "WWW-Authenticate: Basic realm=\"wlonvif\"\r\n"
+                            : "WWW-Authenticate: Bearer realm=\"basic\"\r\n";
                 response = "HTTP/1.1 401 Unauthorized\r\n" + header +
                            "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n";
             }
@@ -402,6 +404,22 @@ int main()
             CHECK(response);
             // The caller sees the 401 and decides; the transport does not guess.
             CHECK(response && response.value().status == 401);
+            CHECK(server.authorizations().empty());
+        }
+    }
+
+    // ---- Authentication scheme names are parsed as tokens, not substrings ----
+    {
+        TestServer server(Challenge::bearer_basic_realm);
+        CHECK(server.valid());
+        if (server.valid())
+        {
+            auto response = sync(
+                transport->send(soap_request(server.url(), permissive), CancellationSource{}.token())
+            );
+            CHECK(!response);
+            if (!response)
+                CHECK(response.error().category == ErrorCategory::authentication);
             CHECK(server.authorizations().empty());
         }
     }

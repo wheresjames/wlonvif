@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <optional>
 #include <queue>
 #include <stdexcept>
@@ -36,16 +37,44 @@ namespace wlonvif
         tls,                ///< TLS negotiation or verification failure.
         authentication,     ///< Supplied credentials were not accepted.
         authorization,      ///< Authenticated identity lacks permission.
+        device_busy,        ///< Device explicitly reported a documented busy signal.
+        rate_limited,       ///< Peer explicitly requested rate limiting.
         malformed_http,     ///< HTTP metadata or framing was invalid.
         malformed_xml,      ///< XML was invalid or exceeded a structural limit.
         soap_fault,         ///< The peer returned a SOAP Fault.
         unsupported,        ///< The requested feature or dialect is unsupported.
         invalid_argument,   ///< A caller-provided value is invalid.
         endpoint_rejected,  ///< EndpointPolicy rejected the destination.
+        host_permission_denied, ///< Embedding host denied a resolved network candidate.
+        closed_handle,      ///< An operation was requested on a closed public handle.
         protocol_violation, ///< The peer response violated the operation contract.
         closed,             ///< The owning session, stream, or runtime is closed.
         queue_overflow,     ///< A bounded queue cannot accept more data.
         internal            ///< Unexpected library failure.
+    };
+
+    /// Owned HTTP response detail attached to an Error.
+    struct HttpErrorDetail
+    {
+        long status{};
+    };
+
+    /// Bounded, sanitized SOAP Fault fields attached to an Error.
+    struct SoapFaultDetail
+    {
+        std::string code;
+        std::string subcode;
+        std::string reason;
+        std::string detail;
+    };
+
+    /// Audit context for a host network permission denial.
+    struct HostPermissionDetail
+    {
+        std::string hostname;
+        std::uint16_t port{};
+        std::string proposed_address;
+        std::string resolution_attempt_id;
     };
 
     /// Identifies the ONVIF operation associated with a result or diagnostic.
@@ -74,6 +103,32 @@ namespace wlonvif
         event_close               ///< Event subscription closure.
     };
 
+    /// Outcome of a bounded best-effort safety action.
+    struct SafetyActionDetail
+    {
+        OperationId operation{OperationId::ptz_stop}; ///< Safety operation attempted.
+        bool attempted{false}; ///< Whether the safety action was issued.
+        bool succeeded{false}; ///< Whether the device accepted the safety action.
+        std::optional<ErrorCategory> failure_category; ///< Redacted failure classification.
+        std::string failure_code; ///< Bounded SOAP or HTTP failure code.
+    };
+
+    /// Compile-time and runtime capabilities used by embedding adapters.
+    struct LibraryFeatures
+    {
+        bool candidate_authorization{true};
+        bool credential_providers{true};
+        bool deterministic_session_close{true};
+        bool ptz_safety_ledger{true};
+        bool pullpoint_subscription{true};
+        bool discovery_streaming{false};
+    };
+
+    /// Native library semantic version.
+    std::string_view library_version() noexcept;
+    /// Native contracts available in this build.
+    LibraryFeatures library_features() noexcept;
+
     /**
      * @brief Structured error returned by public asynchronous operations.
      *
@@ -87,6 +142,10 @@ namespace wlonvif
         std::string message;   ///< Human-readable, redacted diagnostic message.
         bool retryable{false}; ///< Whether a policy may safely retry the operation.
         bool request_may_have_been_applied{false}; ///< Device outcome may be uncertain.
+        std::optional<HttpErrorDetail> http;
+        std::optional<SoapFaultDetail> soap_fault;
+        std::optional<HostPermissionDetail> host_permission;
+        std::optional<SafetyActionDetail> safety_action;
 
         /// Construct an internal error with default values.
         Error() = default;
@@ -220,14 +279,17 @@ namespace wlonvif
         bool post(std::function<void()> fn) noexcept override;
         /// Stop accepting work, drain accepted work, and join the worker.
         Result<void> shutdown();
+        /// Register bounded native cleanup to run before worker shutdown.
+        std::size_t register_shutdown_participant(std::function<void()> participant);
+        /// Remove a previously registered shutdown participant.
+        void unregister_shutdown_participant(std::size_t identifier) noexcept;
 
       private:
+        struct State;
         Runtime();
-        void run();
-        std::mutex mutex_;
-        std::condition_variable cv_;
-        std::queue<std::function<void()>> queue_;
-        bool stopping_{false};
+        static void run(std::shared_ptr<State> state);
+        std::shared_ptr<State> state_;
+        std::mutex shutdown_mutex_;
         std::thread worker_;
     };
 
@@ -238,13 +300,23 @@ namespace wlonvif
         /// Return true after the associated source requests cancellation.
         bool stop_requested() const noexcept;
 
+        /// Return a token cancelled when either input token is cancelled.
+        static CancellationToken linked(CancellationToken first, CancellationToken second)
+        {
+            return CancellationToken(std::move(first.state_), std::move(second.state_));
+        }
+
       private:
         friend class CancellationSource;
         explicit CancellationToken(std::shared_ptr<std::atomic_bool> state)
             : state_(std::move(state))
         {
         }
+        CancellationToken(
+            std::shared_ptr<std::atomic_bool> state, std::shared_ptr<std::atomic_bool> other
+        ) : state_(std::move(state)), other_(std::move(other)) {}
         std::shared_ptr<std::atomic_bool> state_;
+        std::shared_ptr<std::atomic_bool> other_;
     };
     /// Owner that can request cancellation for associated CancellationToken values.
     class CancellationSource
@@ -347,6 +419,82 @@ namespace wlonvif
         bool allow_cleartext_basic{false}; ///< Permit HTTP Basic authentication without TLS.
     };
 
+    /// Move-only secret material scoped to one operation and authentication sequence.
+    class CredentialLease
+    {
+      public:
+        CredentialLease(std::string username, std::string password, bool allow_cleartext_basic = false);
+        ~CredentialLease();
+        CredentialLease(CredentialLease&&) noexcept;
+        CredentialLease& operator=(CredentialLease&&) noexcept;
+        CredentialLease(const CredentialLease&) = delete;
+        CredentialLease& operator=(const CredentialLease&) = delete;
+        std::string_view username() const noexcept { return username_; }
+        std::string_view password() const noexcept { return password_; }
+        bool allow_cleartext_basic() const noexcept { return allow_cleartext_basic_; }
+      private:
+        void erase() noexcept;
+        std::string username_;
+        std::string password_;
+        bool allow_cleartext_basic_{};
+    };
+
+    /// Asynchronous source of independent operation credential leases.
+    class CredentialProvider
+    {
+      public:
+        virtual ~CredentialProvider() = default;
+        virtual Task<Result<CredentialLease>> acquire(CallOptions options) = 0;
+        virtual void close() noexcept = 0;
+    };
+
+    std::shared_ptr<CredentialProvider> make_fixed_credential_provider(Credentials credentials);
+
+    enum class EndpointPurpose
+    {
+        device, media, ptz, events, download
+    };
+
+    enum class EndpointProvenance
+    {
+        caller_supplied, device_advertised, redirect, replacement
+    };
+
+    /// Post-resolution context supplied before any socket is created.
+    struct CandidateAuthorizationRequest
+    {
+        std::string original_url;
+        std::string effective_url;
+        std::string hostname;
+        std::uint16_t port{};
+        std::vector<std::string> resolved_addresses;
+        std::string proposed_address;
+        EndpointPurpose purpose{EndpointPurpose::device};
+        EndpointProvenance provenance{EndpointProvenance::caller_supplied};
+        std::string resolution_attempt_id;
+        std::optional<OperationId> operation; ///< Operation metadata, when applicable.
+        bool idempotent{true}; ///< Whether repeating the request is semantically safe.
+        bool retry_allowed{false}; ///< Whether native retry policy may repeat the request.
+    };
+
+    /// Embedding-host authorization boundary for resolved connection candidates.
+    class CandidateAuthorizer
+    {
+      public:
+        virtual ~CandidateAuthorizer() = default;
+        virtual Task<Result<void>> authorize(
+            CandidateAuthorizationRequest request, CallOptions options
+        ) = 0;
+    };
+
+    /// Configuration for the default HTTP transport.
+    struct CurlTransportOptions
+    {
+        std::shared_ptr<Runtime> runtime;
+        XmlLimits limits{};
+        std::shared_ptr<CandidateAuthorizer> candidate_authorizer;
+    };
+
     /// Owned HTTP request passed to HttpTransport.
     enum class HttpMethod
     {
@@ -357,12 +505,29 @@ namespace wlonvif
     /// Owned HTTP request passed to HttpTransport.
     struct HttpRequest
     {
+        HttpRequest() = default;
+        HttpRequest(
+            std::string url_value, std::string body_value,
+            std::vector<std::string> headers_value,
+            std::chrono::steady_clock::time_point deadline_value,
+            std::optional<Credentials> credentials_value = {},
+            HttpMethod method_value = HttpMethod::post
+        ) : url(std::move(url_value)), body(std::move(body_value)),
+            headers(std::move(headers_value)), deadline(deadline_value),
+            credentials(std::move(credentials_value)), method(method_value) {}
         std::string url;                                ///< Authorized destination URL.
         std::string body;                               ///< Request body bytes.
         std::vector<std::string> headers;               ///< Complete request header lines.
         std::chrono::steady_clock::time_point deadline; ///< Absolute transport deadline.
-        std::optional<Credentials> credentials;         ///< Optional HTTP authentication data.
+        std::optional<Credentials> credentials; ///< Compatibility credential value.
         HttpMethod method{HttpMethod::post};             ///< HTTP request method.
+        std::shared_ptr<CredentialLease> credential_lease; ///< Operation-bounded authentication.
+        std::string original_url;
+        EndpointPurpose purpose{EndpointPurpose::device};
+        EndpointProvenance provenance{EndpointProvenance::caller_supplied};
+        std::optional<OperationId> operation; ///< Operation metadata, when applicable.
+        bool idempotent{true}; ///< Whether repeating the request is semantically safe.
+        bool retry_allowed{false}; ///< Whether native retry policy may repeat the request.
     };
 
     /// Bounded HTTP response returned by HttpTransport.
@@ -396,6 +561,7 @@ namespace wlonvif
      */
     std::shared_ptr<HttpTransport>
     make_curl_transport(std::shared_ptr<Runtime> runtime, XmlLimits limits = {});
+    std::shared_ptr<HttpTransport> make_curl_transport(CurlTransportOptions options);
 
     /// Authorizes every endpoint before a transport connects to it.
     class EndpointPolicy
@@ -570,6 +736,7 @@ namespace wlonvif
     {
         bool request_may_have_been_applied{false}; ///< Delivery outcome is uncertain.
         std::optional<Error> stop_error;           ///< Failure of a best-effort safety Stop.
+        std::optional<SafetyActionDetail> safety_action; ///< Safety Stop outcome, when attempted.
     };
 
     /// Select whether velocity ramps are produced by the host or camera firmware.
@@ -812,6 +979,14 @@ namespace wlonvif
     };
     using EventOrHealth = std::variant<Event, StreamHealth>; ///< Stream output item.
 
+    /// Opaque backend identity and timing returned by PullPoint creation or renewal.
+    struct PullPointSubscriptionInfo
+    {
+        std::string token; ///< Backend-owned opaque subscription identity.
+        std::string endpoint; ///< Authorized subscription endpoint, when network-backed.
+        std::chrono::system_clock::time_point termination_time; ///< Advertised expiry.
+    };
+
     /// Type of WS-Discovery observation.
     enum class DiscoveryKind
     {
@@ -909,6 +1084,40 @@ namespace wlonvif
          * Exceptions thrown by the callback are ignored.
          */
         std::function<void(const DiscoveryProgress&)> progress;
+        std::shared_ptr<class DiscoveryAuthorizer> authorizer; ///< Socket-action authorization.
+        bool require_authorization{false}; ///< Reject network actions when no authorizer exists.
+    };
+
+    /// Native network action requested by device discovery.
+    enum class DiscoveryNetworkAction
+    {
+        enumerate_interfaces,
+        bind_udp,
+        join_multicast,
+        send_multicast,
+        send_unicast,
+        scan_network,
+        connect_tcp
+    };
+
+    /// Exact socket or network-range action proposed by discovery.
+    struct DiscoveryAuthorizationRequest
+    {
+        DiscoveryNetworkAction action{DiscoveryNetworkAction::enumerate_interfaces};
+        std::string interface_address;
+        std::string destination;
+        std::uint16_t port{};
+        std::optional<std::string> network;
+    };
+
+    /// Authorization boundary invoked immediately before discovery network actions.
+    class DiscoveryAuthorizer
+    {
+      public:
+        virtual ~DiscoveryAuthorizer() = default;
+        virtual Task<Result<void>> authorize(
+            DiscoveryAuthorizationRequest request, CallOptions options
+        ) = 0;
     };
 
     /**
@@ -979,6 +1188,21 @@ namespace wlonvif
         virtual Result<void> renew_events() = 0;
         /// Close an active Event subscription when applicable.
         virtual Result<void> close_events() = 0;
+        /// Create an independent PullPoint subscription.
+        virtual Result<PullPointSubscriptionInfo>
+        create_event_subscription(std::chrono::seconds requested_lifetime);
+        /// Pull messages from one explicit subscription.
+        virtual Result<std::vector<Event>> pull_event_subscription(
+            const std::string& token,
+            std::chrono::milliseconds server_timeout,
+            std::size_t maximum
+        );
+        /// Renew one explicit subscription and return its new timing.
+        virtual Result<PullPointSubscriptionInfo> renew_event_subscription(
+            const std::string& token, std::chrono::seconds requested_lifetime
+        );
+        /// Unsubscribe one explicit subscription. Idempotent after success.
+        virtual Result<void> close_event_subscription(const std::string& token);
     };
 
     /// Domain-oriented Media1 client.
@@ -1035,8 +1259,15 @@ namespace wlonvif
         goto_preset(ProfileToken profile, PresetToken preset, CallOptions options);
 
       private:
+        friend class DeviceSession;
+        PtzClient(
+            std::shared_ptr<Runtime> runtime,
+            std::shared_ptr<ServiceBackend> backend,
+            std::shared_ptr<class PtzSafetyState> safety
+        );
         std::shared_ptr<Runtime> runtime_;
         std::shared_ptr<ServiceBackend> backend_;
+        std::shared_ptr<class PtzSafetyState> safety_;
     };
 
     /**
@@ -1102,8 +1333,88 @@ namespace wlonvif
         std::shared_ptr<Runtime> runtime_;
     };
 
+    /// Structured outcome of caller-visible bounded cleanup.
+    struct CloseResult
+    {
+        bool cleanup_complete{true};
+        bool safety_complete{true};
+    };
+    class ManagedEventStream;
+
+    /// Options used when creating an explicit PullPoint subscription.
+    struct PullPointSubscriptionOptions
+    {
+        std::chrono::seconds requested_lifetime{60}; ///< Requested initial subscription lifetime.
+    };
+
+    /// Caller-visible lifecycle state of an explicit PullPoint subscription.
+    enum class PullPointSubscriptionState { open, closing, closed };
+
+    /// Independent PullPoint subscription with explicit pull, renew, and cleanup.
+    class PullPointSubscription final :
+        public std::enable_shared_from_this<PullPointSubscription>
+    {
+      public:
+        /// Pull at most @p maximum_messages, allowing the server to wait up to @p server_timeout.
+        Task<Result<std::vector<Event>>> pull(
+            std::chrono::milliseconds server_timeout,
+            std::size_t maximum_messages,
+            CallOptions options
+        );
+        /// Renew the subscription and return its updated endpoint and expiry information.
+        Task<Result<PullPointSubscriptionInfo>> renew(
+            std::chrono::seconds requested_lifetime, CallOptions options
+        );
+        /// Unsubscribe from the remote PullPoint. Idempotent after successful closure.
+        Task<Result<void>> unsubscribe(CallOptions options);
+        /// Attempt bounded cleanup and report whether it completed within the budget.
+        Task<Result<CloseResult>> close(std::chrono::milliseconds cleanup_budget);
+        /// Return a lock-consistent copy of the current subscription information.
+        PullPointSubscriptionInfo info() const;
+        /// Return the current local lifecycle state.
+        PullPointSubscriptionState state() const noexcept;
+
+      private:
+        friend class EventClient;
+        friend class ManagedEventStream;
+        struct Impl;
+        explicit PullPointSubscription(std::shared_ptr<Impl>);
+        std::shared_ptr<Impl> impl_;
+    };
+
+    /// Resource, polling, renewal, and reconnect bounds for an automatic Event stream.
+    struct ManagedEventOptions
+    {
+        std::size_t queue_capacity{256}; ///< Maximum queued events and health items.
+        std::size_t pull_limit{32}; ///< Maximum messages requested by each PullMessages call.
+        std::chrono::milliseconds pull_timeout{5000}; ///< Server-side long-poll timeout.
+        std::chrono::milliseconds minimum_backoff{250}; ///< Initial reconnect delay.
+        std::chrono::milliseconds maximum_backoff{30000}; ///< Maximum reconnect delay.
+        std::chrono::seconds requested_lifetime{60}; ///< Subscription and renewal lifetime.
+    };
+
+    /// Factory for explicit PullPoint subscriptions and automatic managed streams.
+    class EventClient
+    {
+      public:
+        /// Bind an Event client to a runtime and service backend.
+        EventClient(std::shared_ptr<Runtime> runtime, std::shared_ptr<ServiceBackend> backend);
+        /// Create an independent explicit PullPoint subscription.
+        Task<Result<std::shared_ptr<PullPointSubscription>>> create_pullpoint(
+            PullPointSubscriptionOptions options, CallOptions call
+        );
+        /// Create a subscription and start its bounded polling and reconnect worker.
+        Task<Result<std::shared_ptr<ManagedEventStream>>> open_managed_stream(
+            ManagedEventOptions options, CallOptions call
+        );
+
+      private:
+        std::shared_ptr<Runtime> runtime_;
+        std::shared_ptr<ServiceBackend> backend_;
+    };
+
     /// Managed, bounded stream of events and observable continuity health signals.
-    class ManagedEventStream
+    class ManagedEventStream : public std::enable_shared_from_this<ManagedEventStream>
     {
       public:
         /**
@@ -1117,6 +1428,7 @@ namespace wlonvif
             std::shared_ptr<ServiceBackend> backend,
             std::size_t maximum_events = 256
         );
+        ~ManagedEventStream();
         /// Remove and return the next event or health item.
         Task<Result<EventOrHealth>> next(CallOptions options);
         /// Pull at most @p maximum events into the bounded managed queue.
@@ -1127,10 +1439,22 @@ namespace wlonvif
         Task<Result<void>> close(CallOptions options);
 
       private:
+        friend class EventClient;
+        ManagedEventStream(
+            std::shared_ptr<Runtime> runtime,
+            std::shared_ptr<ServiceBackend> backend,
+            std::shared_ptr<PullPointSubscription> subscription,
+            ManagedEventOptions options
+        );
+        void run_managed();
         struct State;
         std::shared_ptr<State> state_;
         std::shared_ptr<Runtime> runtime_;
         std::shared_ptr<ServiceBackend> backend_;
+        std::shared_ptr<PullPointSubscription> subscription_;
+        ManagedEventOptions managed_options_;
+        CancellationSource managed_stop_;
+        std::thread managed_worker_;
     };
 
     /**
@@ -1157,6 +1481,10 @@ namespace wlonvif
         const std::optional<Credentials>& credentials = {}
     );
 
+    std::string soap_envelope(
+        OperationId operation, std::string_view body, const CredentialLease* credentials
+    );
+
     /**
      * @brief Validate bounded SOAP XML and locate an operation response.
      * @param xml Untrusted XML bytes.
@@ -1174,9 +1502,22 @@ namespace wlonvif
      * DeviceSession stores the authorized Device endpoint, credentials, transport,
      * and runtime. It does not own persistent inventory.
      */
+    /// Validated ownership and policy inputs used to construct a device session.
+    struct DeviceSessionOptions
+    {
+        std::string device_url;
+        std::shared_ptr<HttpTransport> transport;
+        std::shared_ptr<EndpointPolicy> endpoint_policy;
+        std::shared_ptr<Runtime> runtime;
+        std::shared_ptr<CredentialProvider> credential_provider;
+        CallOptions call;
+    };
+
+    /// Thread-safe owner of a connected device and all child-operation cancellation.
     class DeviceSession : public std::enable_shared_from_this<DeviceSession>
     {
       public:
+        ~DeviceSession();
         /**
          * @brief Create a session for an explicitly supplied Device service URL.
          * @param device_url Caller-authorized Device service URL.
@@ -1195,6 +1536,9 @@ namespace wlonvif
             std::optional<Credentials> credentials,
             CallOptions options
         );
+        static Task<Result<std::shared_ptr<DeviceSession>>> connect(DeviceSessionOptions options);
+        Task<Result<CloseResult>> close(std::chrono::milliseconds cleanup_budget);
+        bool is_closed() const noexcept;
         /// Execute GetDeviceInformation.
         Task<Result<DeviceInformation>> get_device_information(CallOptions options);
         /// Execute GetSystemDateAndTime.
@@ -1209,6 +1553,8 @@ namespace wlonvif
         Result<std::shared_ptr<MediaClient>> media();
         /// Return a PTZ client when the transport supplies PTZ behavior.
         Result<std::shared_ptr<PtzClient>> ptz();
+        /// Return the explicit Event service client.
+        Result<std::shared_ptr<EventClient>> event_client();
         /// Return a bounded managed Event stream.
         Result<std::shared_ptr<ManagedEventStream>> events(std::size_t maximum_events = 256);
 
@@ -1218,17 +1564,30 @@ namespace wlonvif
             std::shared_ptr<HttpTransport>,
             std::shared_ptr<EndpointPolicy>,
             std::shared_ptr<Runtime>,
-            std::optional<Credentials>
+            std::shared_ptr<CredentialProvider>
         );
         Task<Result<std::string>> invoke(OperationId, std::string_view response, CallOptions);
+        void operation_finished() noexcept;
+        void register_runtime_shutdown();
+        void shutdown_from_runtime() noexcept;
         std::shared_ptr<ServiceBackend> backend();
+        std::shared_ptr<class PtzSafetyState> ptz_safety();
         std::string url_;
         std::shared_ptr<HttpTransport> transport_;
         std::shared_ptr<EndpointPolicy> endpoint_policy_;
         std::shared_ptr<Runtime> runtime_;
-        std::optional<Credentials> credentials_;
+        std::shared_ptr<CredentialProvider> credential_provider_;
+        enum class State { open, closing, closed };
+        mutable std::mutex state_mutex_;
+        State state_{State::open};
+        CancellationSource session_cancellation_;
+        std::vector<std::function<void(Result<CloseResult>)>> close_waiters_;
+        std::size_t active_operations_{};
         std::mutex backend_mutex_;
         std::shared_ptr<ServiceBackend> backend_;
+        std::shared_ptr<class PtzSafetyState> ptz_safety_;
+        bool close_safety_complete_{true};
+        std::size_t runtime_shutdown_registration_{};
     };
 
     /**
@@ -1263,6 +1622,14 @@ namespace wlonvif
         void add_preset(ProfileToken, Preset);
         /// Append an event to the virtual PullPoint queue.
         void emit(Event);
+        /// Fail the next movement with a supplied deterministic error.
+        void fail_next_move(Error error);
+        /// Configure or clear a deterministic Stop failure.
+        void set_stop_failure(std::optional<Error> error);
+        /// Delay Stop to exercise bounded cleanup behavior.
+        void set_stop_delay(std::chrono::milliseconds delay);
+        /// Return the number of Stop attempts made for a profile.
+        std::size_t stop_attempts(const ProfileToken& profile) const;
         /// Return configured profiles.
         Result<std::vector<MediaProfile>> profiles() override;
         /// Return the configured stream URI.

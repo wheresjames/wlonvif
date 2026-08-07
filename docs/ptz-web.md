@@ -37,9 +37,14 @@ diagnostic mode: `--ffmpeg-stream 'rtsp://relay.example/stream'`.
 
 Use `--ffmpeg PATH` when FFmpeg is not on `PATH`. The process is spawned directly
 without a shell, its standard input and diagnostics are closed, frames are bounded
-to 4 MiB, and shutdown terminates and reaps it. RTSP uses TCP and is converted to
+to 4 MiB, and shutdown gives it two seconds after `SIGTERM` before forcing and
+reaping it. RTSP uses TCP and is converted to
 15 FPS, video-only MJPEG. Failure to find FFmpeg is reported at startup; later
 stream/authentication failures appear as an empty video surface.
+
+Server shutdown interrupts every accepted HTTP, TLS, WebSocket, and MJPEG socket
+before joining its worker. Initial HTTP and TLS negotiation also have five-second
+deadlines, so incomplete or stalled clients cannot indefinitely retain a worker.
 
 The discovered or explicit stream URI is passed to FFmpeg as an argument. The
 program prints a warning without printing the URI. Embedding credentials in that

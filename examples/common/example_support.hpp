@@ -79,6 +79,10 @@ namespace wlonvif::examples
     );
     CallOptions call_options(int timeout_seconds);
     CallOptions safety_call_options(int timeout_seconds);
+    /// Return true after SIGINT or SIGTERM is observed by the shared example handler.
+    bool shutdown_requested();
+    /// Wait for a duration, returning early when shutdown is requested.
+    bool interruptible_wait(std::chrono::milliseconds duration);
     bool parse_size(std::string_view text, std::size_t& output);
     bool progress_is_terminal();
     std::string json_escape(std::string_view input);

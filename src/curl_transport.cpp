@@ -1,5 +1,17 @@
 #include <algorithm>
+#include <condition_variable>
+#include <cstdlib>
+#include <limits>
 #include <curl/curl.h>
+#include <openssl/crypto.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#endif
 #include "curl_init.hpp"
 #include "dispatch.hpp"
 #include <wlonvif/wlonvif.hpp>
@@ -17,6 +29,11 @@ namespace wlonvif
         size_t write_cb(char* p, size_t s, size_t n, void* u)
         {
             auto& context = *static_cast<WriteContext*>(u);
+            if (n != 0 && s > std::numeric_limits<std::size_t>::max() / n)
+            {
+                context.exceeded = true;
+                return 0;
+            }
             const auto bytes = s * n;
             if (bytes > context.maximum - std::min(context.output->size(), context.maximum))
             {
@@ -39,6 +56,7 @@ namespace wlonvif
         size_t header_cb(char* p, size_t s, size_t n, void* u)
         {
             auto& context = *static_cast<HeaderContext*>(u);
+            if (n != 0 && s > std::numeric_limits<std::size_t>::max() / n) return 0;
             const auto bytes = s * n;
             constexpr std::string_view name = "www-authenticate:";
             std::string_view line(p, bytes);
@@ -62,11 +80,14 @@ namespace wlonvif
                     {
                         value.remove_suffix(1);
                     }
-                    if (!context.challenge.empty())
+                    const auto separator = context.challenge.empty() ? 0u : 2u;
+                    const auto available = HeaderContext::maximum - context.challenge.size();
+                    if (available <= separator) return bytes;
+                    if (separator != 0)
                     {
                         context.challenge += ", ";
                     }
-                    context.challenge += value;
+                    context.challenge.append(value.substr(0, available - separator));
                 }
             }
             return bytes;
@@ -83,11 +104,103 @@ namespace wlonvif
             );
             return output;
         }
+        bool offers_auth_scheme(std::string_view challenge, std::string_view scheme)
+        {
+            for (std::size_t position = 0; position < challenge.size();)
+            {
+                while (position < challenge.size() &&
+                       (challenge[position] == ',' || std::isspace(
+                           static_cast<unsigned char>(challenge[position]))))
+                    ++position;
+                const auto begin = position;
+                while (position < challenge.size() &&
+                       (std::isalnum(static_cast<unsigned char>(challenge[position])) ||
+                        challenge[position] == '-' || challenge[position] == '_'))
+                    ++position;
+                if (challenge.substr(begin, position - begin) == scheme &&
+                    (position == challenge.size() ||
+                     std::isspace(static_cast<unsigned char>(challenge[position]))))
+                    return true;
+                position = challenge.find(',', position);
+                if (position == challenge.npos) break;
+            }
+            return false;
+        }
+        Result<std::vector<std::string>> resolve_host(
+            std::string host,
+            std::string port,
+            std::chrono::steady_clock::time_point deadline,
+            CancellationToken token
+        )
+        {
+            struct State
+            {
+                std::mutex mutex;
+                std::condition_variable ready;
+                bool done{};
+                int code{};
+                std::vector<std::string> addresses;
+            };
+            auto state = std::make_shared<State>();
+            try
+            {
+                std::thread([state, host = std::move(host), port = std::move(port)]
+                {
+                    addrinfo hints{};
+                    hints.ai_socktype = SOCK_STREAM;
+                    hints.ai_family = AF_UNSPEC;
+                    addrinfo* results = nullptr;
+                    const int code = getaddrinfo(host.c_str(), port.c_str(), &hints, &results);
+                    std::vector<std::string> addresses;
+                    for (auto* item = results; item; item = item->ai_next)
+                    {
+                        char buffer[INET6_ADDRSTRLEN]{};
+                        const void* address = item->ai_family == AF_INET
+                            ? static_cast<const void*>(&reinterpret_cast<sockaddr_in*>(item->ai_addr)->sin_addr)
+                            : item->ai_family == AF_INET6
+                                ? static_cast<const void*>(&reinterpret_cast<sockaddr_in6*>(item->ai_addr)->sin6_addr)
+                                : nullptr;
+                        if (address && inet_ntop(item->ai_family, address, buffer, sizeof(buffer)) &&
+                            std::find(addresses.begin(), addresses.end(), buffer) == addresses.end())
+                            addresses.emplace_back(buffer);
+                    }
+                    if (results) freeaddrinfo(results);
+                    {
+                        std::lock_guard lock(state->mutex);
+                        state->code = code;
+                        state->addresses = std::move(addresses);
+                        state->done = true;
+                    }
+                    state->ready.notify_one();
+                }).detach();
+            }
+            catch (const std::exception& error)
+            {
+                return Error{ErrorCategory::internal, {}, error.what()};
+            }
+            std::unique_lock lock(state->mutex);
+            while (!state->done && !token.stop_requested() &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                state->ready.wait_until(
+                    lock,
+                    std::min(deadline, std::chrono::steady_clock::now() +
+                                           std::chrono::milliseconds(20))
+                );
+            }
+            if (token.stop_requested()) return Error{ErrorCategory::cancelled};
+            if (!state->done) return Error{ErrorCategory::timeout};
+            if (state->code != 0 || state->addresses.empty())
+                return Error{ErrorCategory::network, {}, "DNS resolution failed", true};
+            return std::move(state->addresses);
+        }
         class CurlTransport final : public HttpTransport
         {
           public:
-            CurlTransport(std::shared_ptr<Runtime> r, XmlLimits l)
-                : runtime_(std::move(r)), limits_(l)
+            CurlTransport(
+                std::shared_ptr<Runtime> r, XmlLimits l,
+                std::shared_ptr<CandidateAuthorizer> authorizer = {}
+            ) : runtime_(std::move(r)), limits_(l), authorizer_(std::move(authorizer))
             {
                 detail::initialize_curl();
             }
@@ -95,11 +208,12 @@ namespace wlonvif
             {
                 auto rt = runtime_;
                 auto lim = limits_;
+                auto authorizer = authorizer_;
                 return Task<Result<HttpResponse>>(
-                    [rt, lim, req = std::move(req), token](auto done) mutable
+                    [rt, lim, authorizer, req = std::move(req), token](auto done) mutable
                     {
                         std::thread(
-                            [rt, lim, req = std::move(req), token, done = std::move(done)]() mutable
+                            [rt, lim, authorizer, req = std::move(req), token, done = std::move(done)]() mutable
                             {
                                 if (token.stop_requested())
                                 {
@@ -111,6 +225,86 @@ namespace wlonvif
                                         }
                                     );
                                     return;
+                                }
+                                curl_slist* pinned = nullptr;
+                                if (authorizer)
+                                {
+                                    CURLU* parsed = curl_url();
+                                    char* host_value = nullptr;
+                                    char* port_value = nullptr;
+                                    const auto url_code = parsed ? curl_url_set(parsed, CURLUPART_URL, req.url.c_str(), 0) : CURLUE_BAD_HANDLE;
+                                    if (url_code == CURLUE_OK) curl_url_get(parsed, CURLUPART_HOST, &host_value, 0);
+                                    if (url_code == CURLUE_OK) curl_url_get(parsed, CURLUPART_PORT, &port_value, CURLU_DEFAULT_PORT);
+                                    if (!host_value || !port_value)
+                                    {
+                                        if (host_value) curl_free(host_value);
+                                        if (port_value) curl_free(port_value);
+                                        if (parsed) curl_url_cleanup(parsed);
+                                        detail::dispatch(rt, [done = std::move(done)]() mutable { done(Error{ErrorCategory::invalid_argument, {}, "HTTP URL has no resolvable host"}); });
+                                        return;
+                                    }
+                                    char* port_end = nullptr;
+                                    const auto parsed_port = std::strtoul(port_value, &port_end, 10);
+                                    if (!port_end || *port_end != '\0' || parsed_port > 65535)
+                                    {
+                                        curl_free(host_value); curl_free(port_value); curl_url_cleanup(parsed);
+                                        detail::dispatch(rt, [done = std::move(done)]() mutable { done(Error{ErrorCategory::invalid_argument, {}, "HTTP URL has an invalid port"}); });
+                                        return;
+                                    }
+                                    auto resolved = resolve_host(
+                                        host_value, port_value, req.deadline, token
+                                    );
+                                    if (!resolved)
+                                    {
+                                        curl_free(host_value); curl_free(port_value); curl_url_cleanup(parsed);
+                                        auto error = resolved.error();
+                                        detail::dispatch(rt, [done = std::move(done), error = std::move(error)]() mutable { done(std::move(error)); });
+                                        return;
+                                    }
+                                    auto addresses = std::move(resolved.value());
+                                    static std::atomic_uint64_t attempt{0};
+                                    CandidateAuthorizationRequest request;
+                                    request.original_url = req.original_url.empty()
+                                        ? req.url : req.original_url;
+                                    request.effective_url = req.url;
+                                    request.hostname = lowercase(host_value);
+                                    request.port = static_cast<std::uint16_t>(parsed_port);
+                                    request.resolved_addresses = addresses;
+                                    request.proposed_address = addresses.front();
+                                    request.purpose = req.purpose;
+                                    request.provenance = req.provenance;
+                                    request.resolution_attempt_id = std::to_string(++attempt);
+                                    request.operation = req.operation;
+                                    request.idempotent = req.idempotent;
+                                    request.retry_allowed = req.retry_allowed;
+                                    struct Approval { std::mutex mutex; std::condition_variable cv; std::optional<Result<void>> result; };
+                                    auto approval = std::make_shared<Approval>();
+                                    auto task = authorizer->authorize(request, {req.deadline, token});
+                                    std::move(task).start([approval](Result<void> value) { std::lock_guard lock(approval->mutex); approval->result.emplace(std::move(value)); approval->cv.notify_one(); });
+                                    std::unique_lock lock(approval->mutex);
+                                    while (!approval->result && !token.stop_requested() && std::chrono::steady_clock::now() < req.deadline)
+                                        approval->cv.wait_until(lock, req.deadline);
+                                    Result<void> authorized = token.stop_requested()
+                                        ? Result<void>(Error{ErrorCategory::cancelled})
+                                        : !approval->result ? Result<void>(Error{ErrorCategory::timeout})
+                                                           : std::move(*approval->result);
+                                    if (!authorized)
+                                    {
+                                        auto error = authorized.error();
+                                        if (error.category != ErrorCategory::cancelled && error.category != ErrorCategory::timeout)
+                                        {
+                                            error.category = ErrorCategory::host_permission_denied;
+                                            error.host_permission = HostPermissionDetail{request.hostname, request.port, request.proposed_address, request.resolution_attempt_id};
+                                        }
+                                        curl_free(host_value); curl_free(port_value); curl_url_cleanup(parsed);
+                                        detail::dispatch(rt, [done = std::move(done), error = std::move(error)]() mutable { done(std::move(error)); });
+                                        return;
+                                    }
+                                    std::string pin = std::string(host_value) + ':' + port_value + ':';
+                                    if (addresses.front().find(':') != std::string::npos) pin += '[' + addresses.front() + ']';
+                                    else pin += addresses.front();
+                                    pinned = curl_slist_append(nullptr, pin.c_str());
+                                    curl_free(host_value); curl_free(port_value); curl_url_cleanup(parsed);
                                 }
                                 CURL* c = curl_easy_init();
                                 if (!c)
@@ -135,6 +329,7 @@ namespace wlonvif
                                     hs = curl_slist_append(hs, h.c_str());
                                 }
                                 curl_easy_setopt(c, CURLOPT_URL, req.url.c_str());
+                                if (pinned) curl_easy_setopt(c, CURLOPT_RESOLVE, pinned);
                                 if (req.method == HttpMethod::get)
                                 {
                                     curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
@@ -186,22 +381,25 @@ namespace wlonvif
                                 curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &response.status);
                                 bool attempted_cleartext_digest = false;
                                 std::optional<Error> auth_error;
-                                if (code == CURLE_OK && response.status == 401 && req.credentials)
+                                if (code == CURLE_OK && response.status == 401 &&
+                                    (req.credentials || req.credential_lease))
                                 {
-                                    const bool encrypted = req.url.starts_with("https://");
+                                    const bool allow_cleartext = req.credential_lease
+                                        ? req.credential_lease->allow_cleartext_basic()
+                                        : req.credentials->allow_cleartext_basic;
+                                    const bool encrypted = lowercase(req.url).starts_with("https://");
                                     const auto challenge = lowercase(header_context.challenge);
-                                    const bool basic_offered =
-                                        challenge.find("basic") != std::string::npos;
+                                    const bool basic_offered = offers_auth_scheme(challenge, "basic");
                                     long methods = 0;
-                                    if (challenge.find("digest") != std::string::npos)
+                                    if (offers_auth_scheme(challenge, "digest"))
                                     {
                                         methods |= CURLAUTH_DIGEST;
                                     }
-                                    if (challenge.find("negotiate") != std::string::npos)
+                                    if (offers_auth_scheme(challenge, "negotiate"))
                                     {
                                         methods |= CURLAUTH_NEGOTIATE;
                                     }
-                                    if (challenge.find("ntlm") != std::string::npos)
+                                    if (offers_auth_scheme(challenge, "ntlm"))
                                     {
                                         methods |= CURLAUTH_NTLM;
                                     }
@@ -209,7 +407,7 @@ namespace wlonvif
                                     // only offered back when the channel is encrypted or the
                                     // caller has explicitly accepted the exposure.
                                     if (basic_offered &&
-                                        (encrypted || req.credentials->allow_cleartext_basic))
+                                        (encrypted || allow_cleartext))
                                     {
                                         methods |= CURLAUTH_BASIC;
                                     }
@@ -217,14 +415,18 @@ namespace wlonvif
                                     {
                                         attempted_cleartext_digest =
                                             !encrypted && (methods & CURLAUTH_DIGEST) != 0;
-                                        curl_easy_setopt(
-                                            c, CURLOPT_USERNAME, req.credentials->username.c_str()
-                                        );
-                                        curl_easy_setopt(
-                                            c, CURLOPT_PASSWORD, req.credentials->password.c_str()
-                                        );
+                                        std::string auth_username = req.credential_lease
+                                            ? std::string(req.credential_lease->username())
+                                            : req.credentials->username;
+                                        std::string auth_password = req.credential_lease
+                                            ? std::string(req.credential_lease->password())
+                                            : req.credentials->password;
+                                        curl_easy_setopt(c, CURLOPT_USERNAME, auth_username.c_str());
+                                        curl_easy_setopt(c, CURLOPT_PASSWORD, auth_password.c_str());
                                         curl_easy_setopt(c, CURLOPT_HTTPAUTH, methods);
                                         code = perform();
+                                        OPENSSL_cleanse(auth_username.data(), auth_username.size());
+                                        OPENSSL_cleanse(auth_password.data(), auth_password.size());
                                         curl_easy_getinfo(
                                             c, CURLINFO_RESPONSE_CODE, &response.status
                                         );
@@ -259,6 +461,7 @@ namespace wlonvif
                                     response.content_type = ct;
                                 }
                                 curl_slist_free_all(hs);
+                                curl_slist_free_all(pinned);
                                 curl_easy_cleanup(c);
                                 Result<HttpResponse> result = std::move(response);
                                 if (auth_error)
@@ -337,10 +540,17 @@ namespace wlonvif
           private:
             std::shared_ptr<Runtime> runtime_;
             XmlLimits limits_;
+            std::shared_ptr<CandidateAuthorizer> authorizer_;
         };
     } // namespace
     std::shared_ptr<HttpTransport> make_curl_transport(std::shared_ptr<Runtime> r, XmlLimits l)
     {
         return std::make_shared<CurlTransport>(std::move(r), l);
+    }
+    std::shared_ptr<HttpTransport> make_curl_transport(CurlTransportOptions options)
+    {
+        return std::make_shared<CurlTransport>(
+            std::move(options.runtime), options.limits, std::move(options.candidate_authorizer)
+        );
     }
 } // namespace wlonvif

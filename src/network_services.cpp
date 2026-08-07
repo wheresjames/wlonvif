@@ -187,11 +187,13 @@ namespace wlonvif
                 std::shared_ptr<HttpTransport> transport,
                 std::shared_ptr<EndpointPolicy> policy,
                 std::shared_ptr<Runtime> runtime,
-                std::optional<Credentials> credentials
+                std::shared_ptr<CredentialProvider> credential_provider,
+                CancellationToken session_cancellation
             )
                 : device_url_(std::move(device_url)), transport_(std::move(transport)),
                   policy_(std::move(policy)), runtime_(std::move(runtime)),
-                  credentials_(std::move(credentials))
+                  credential_provider_(std::move(credential_provider)),
+                  session_cancellation_(std::move(session_cancellation))
             {
             }
 
@@ -474,11 +476,9 @@ namespace wlonvif
                 );
                 if (!response)
                 {
-                    auto error = response.error();
-                    error.request_may_have_been_applied = true;
-                    return error;
+                    return response.error();
                 }
-                return MoveResult{true, std::nullopt};
+                return MoveResult{false, std::nullopt, std::nullopt};
             }
 
             Result<MoveResult> absolute_move(
@@ -562,11 +562,9 @@ namespace wlonvif
                 );
                 if (!response)
                 {
-                    auto error = response.error();
-                    error.request_may_have_been_applied = true;
-                    return error;
+                    return response.error();
                 }
-                return MoveResult{true, std::nullopt};
+                return MoveResult{false, std::nullopt, std::nullopt};
             }
 
             Result<void> stop(const ProfileToken& profile) override
@@ -649,45 +647,66 @@ namespace wlonvif
                 return response ? Result<void>{} : Result<void>{response.error()};
             }
 
-            Result<std::vector<Event>> pull_events(std::size_t maximum) override
+            Result<PullPointSubscriptionInfo> create_event_subscription(
+                std::chrono::seconds requested_lifetime
+            ) override
             {
                 std::lock_guard lock(event_mutex_);
-                if (subscription_url_.empty())
+                auto endpoint = service_endpoint(Service::events);
+                if (!endpoint) return endpoint.error();
+                auto subscribed = invoke(
+                    endpoint.value(),
+                    OperationId::event_subscribe,
+                    "<tev:InitialTerminationTime>PT" +
+                        std::to_string(requested_lifetime.count()) +
+                        "S</tev:InitialTerminationTime>",
+                    "CreatePullPointSubscriptionResponse"
+                );
+                if (!subscribed) return subscribed.error();
+                const auto reference = subtree(subscribed.value(), "SubscriptionReference");
+                auto address = first_element(reference, "Address");
+                if (address.empty())
                 {
-                    auto endpoint = service_endpoint(Service::events);
-                    if (!endpoint) return endpoint.error();
-                    auto subscribed = invoke(
-                        endpoint.value(),
+                    return Error{
+                        ErrorCategory::protocol_violation,
                         OperationId::event_subscribe,
-                        "<tev:InitialTerminationTime>PT60S</tev:InitialTerminationTime>",
-                        "CreatePullPointSubscriptionResponse"
-                    );
-                    if (!subscribed) return subscribed.error();
-                    // The address must come from the SubscriptionReference; the
-                    // envelope also carries wsa:Address elements in its header.
-                    const auto reference = subtree(subscribed.value(), "SubscriptionReference");
-                    subscription_url_ = first_element(reference, "Address");
-                    if (subscription_url_.empty())
-                    {
-                        return Error{
-                            ErrorCategory::protocol_violation,
-                            OperationId::event_subscribe,
-                            "subscription endpoint missing"
-                        };
-                    }
+                        "subscription endpoint missing"
+                    };
                 }
+                auto authorized = policy_->authorize(address, device_url_);
+                if (!authorized) return authorized.error();
+                auto termination = parse_xsd_datetime(
+                    first_element(subscribed.value(), "TerminationTime")
+                ).value_or(std::chrono::system_clock::now() + requested_lifetime);
+                auto token = std::to_string(next_subscription_++);
+                PullPointSubscriptionInfo info{token, std::move(address), termination};
+                subscriptions_.emplace(token, info);
+                return info;
+            }
+
+            Result<std::vector<Event>> pull_event_subscription(
+                const std::string& token,
+                std::chrono::milliseconds server_timeout,
+                std::size_t maximum
+            ) override
+            {
+                std::lock_guard lock(event_mutex_);
+                const auto subscription = subscriptions_.find(token);
+                if (subscription == subscriptions_.end())
+                    return Error{ErrorCategory::closed_handle, OperationId::event_pull,
+                                 "subscription is closed"};
+                const auto seconds = std::max<std::int64_t>(
+                    1, (server_timeout.count() + 999) / 1000
+                );
                 auto response = invoke(
-                    subscription_url_,
+                    subscription->second.endpoint,
                     OperationId::event_pull,
-                    "<tev:Timeout>PT5S</tev:Timeout><tev:MessageLimit>" +
+                    "<tev:Timeout>PT" + std::to_string(seconds) +
+                        "S</tev:Timeout><tev:MessageLimit>" +
                         std::to_string(maximum) + "</tev:MessageLimit>",
                     "PullMessagesResponse"
                 );
-                if (!response)
-                {
-                    subscription_url_.clear();
-                    return response.error();
-                }
+                if (!response) return response.error();
                 std::vector<Event> output;
                 const std::string& xml = response.value();
                 detail_xml::for_each_element(
@@ -747,33 +766,78 @@ namespace wlonvif
                 return output;
             }
 
-            Result<void> renew_events() override
+            Result<PullPointSubscriptionInfo> renew_event_subscription(
+                const std::string& token, std::chrono::seconds requested_lifetime
+            ) override
             {
                 std::lock_guard lock(event_mutex_);
-                if (subscription_url_.empty()) return {};
+                auto subscription = subscriptions_.find(token);
+                if (subscription == subscriptions_.end())
+                    return Error{ErrorCategory::closed_handle, OperationId::event_renew,
+                                 "subscription is closed"};
                 auto response = invoke(
-                    subscription_url_,
+                    subscription->second.endpoint,
                     OperationId::event_renew,
-                    "<wsnt:TerminationTime>PT60S</wsnt:TerminationTime>",
+                    "<wsnt:TerminationTime>PT" +
+                        std::to_string(requested_lifetime.count()) +
+                        "S</wsnt:TerminationTime>",
                     "RenewResponse"
                 );
-                if (!response)
+                if (!response) return response.error();
+                subscription->second.termination_time = parse_xsd_datetime(
+                    first_element(response.value(), "TerminationTime")
+                ).value_or(std::chrono::system_clock::now() + requested_lifetime);
+                return subscription->second;
+            }
+
+            Result<void> close_event_subscription(const std::string& token) override
+            {
+                std::lock_guard lock(event_mutex_);
+                const auto subscription = subscriptions_.find(token);
+                if (subscription == subscriptions_.end()) return {};
+                auto response = invoke(
+                    subscription->second.endpoint,
+                    OperationId::event_close,
+                    {},
+                    "UnsubscribeResponse"
+                );
+                if (response) subscriptions_.erase(subscription);
+                return response ? Result<void>{} : Result<void>{response.error()};
+            }
+
+            Result<std::vector<Event>> pull_events(std::size_t maximum) override
+            {
+                std::lock_guard legacy_lock(legacy_mutex_);
+                if (legacy_subscription_.empty())
                 {
-                    subscription_url_.clear();
-                    return response.error();
+                    auto created = create_event_subscription(std::chrono::seconds(60));
+                    if (!created) return created.error();
+                    legacy_subscription_ = created.value().token;
                 }
-                return {};
+                auto pulled = pull_event_subscription(
+                    legacy_subscription_, std::chrono::seconds(5), maximum
+                );
+                if (!pulled) legacy_subscription_.clear();
+                return pulled;
+            }
+
+            Result<void> renew_events() override
+            {
+                std::lock_guard legacy_lock(legacy_mutex_);
+                if (legacy_subscription_.empty()) return {};
+                auto renewed = renew_event_subscription(
+                    legacy_subscription_, std::chrono::seconds(60)
+                );
+                if (!renewed) legacy_subscription_.clear();
+                return renewed ? Result<void>{} : Result<void>{renewed.error()};
             }
 
             Result<void> close_events() override
             {
-                std::lock_guard lock(event_mutex_);
-                if (subscription_url_.empty()) return {};
-                auto response = invoke(
-                    subscription_url_, OperationId::event_close, {}, "UnsubscribeResponse"
-                );
-                subscription_url_.clear();
-                return response ? Result<void>{} : Result<void>{response.error()};
+                std::lock_guard legacy_lock(legacy_mutex_);
+                if (legacy_subscription_.empty()) return {};
+                const auto token = std::exchange(legacy_subscription_, {});
+                return close_event_subscription(token);
             }
 
           private:
@@ -836,27 +900,76 @@ namespace wlonvif
             {
                 auto authorized = policy_->authorize(endpoint, device_url_);
                 if (!authorized) return authorized.error();
+                auto call = active_call_options.value_or(CallOptions{
+                    std::chrono::steady_clock::now() + std::chrono::seconds(15),
+                    CancellationSource{}.token()
+                });
+                call.cancellation = CancellationToken::linked(
+                    call.cancellation, session_cancellation_
+                );
+                std::shared_ptr<CredentialLease> lease;
+                if (credential_provider_)
+                {
+                    auto acquired = wait_for_task(credential_provider_->acquire(call));
+                    if (!acquired) { auto error = acquired.error(); error.operation = operation; return error; }
+                    lease = std::make_shared<CredentialLease>(std::move(acquired.value()));
+                }
                 HttpRequest request{
                     endpoint,
-                    soap_envelope(operation, body, credentials_),
+                    soap_envelope(operation, body, lease.get()),
                     {"Content-Type: application/soap+xml; charset=utf-8"},
-                    active_call_options
-                        ? active_call_options->deadline
-                        : std::chrono::steady_clock::now() + std::chrono::seconds(15),
-                    credentials_
+                    call.deadline
                 };
+                request.credential_lease = std::move(lease);
+                request.original_url = device_url_;
+                request.provenance = EndpointProvenance::device_advertised;
+                request.operation = operation;
+                const bool movement = operation == OperationId::continuous_move ||
+                    operation == OperationId::relative_move ||
+                    operation == OperationId::absolute_move ||
+                    operation == OperationId::goto_preset;
+                request.idempotent = !movement;
+                request.retry_allowed = false;
+                request.purpose = operation == OperationId::get_profiles ||
+                                  operation == OperationId::get_stream_uri ||
+                                  operation == OperationId::get_snapshot_uri
+                    ? EndpointPurpose::media : operation >= OperationId::ptz_status &&
+                      operation <= OperationId::goto_preset ? EndpointPurpose::ptz
+                                                           : EndpointPurpose::events;
                 auto response = wait_for_task(
                     transport_->send(
                         std::move(request),
-                        active_call_options ? active_call_options->cancellation
-                                            : CancellationSource{}.token()
+                        call.cancellation
                     )
                 );
-                if (!response) return response.error();
+                if (!response)
+                {
+                    auto error = response.error();
+                    if (operation == OperationId::continuous_move ||
+                        operation == OperationId::relative_move ||
+                        operation == OperationId::absolute_move ||
+                        operation == OperationId::goto_preset)
+                        error.request_may_have_been_applied = true;
+                    return error;
+                }
                 if (response.value().status == 401)
-                    return Error{ErrorCategory::authentication, operation, "authentication failed"};
+                {
+                    Error error{ErrorCategory::authentication, operation, "authentication failed"};
+                    error.http = HttpErrorDetail{response.value().status};
+                    return error;
+                }
                 if (response.value().status == 403)
-                    return Error{ErrorCategory::authorization, operation, "request was forbidden"};
+                {
+                    Error error{ErrorCategory::authorization, operation, "request was forbidden"};
+                    error.http = HttpErrorDetail{response.value().status};
+                    return error;
+                }
+                if (response.value().status == 429)
+                {
+                    Error error{ErrorCategory::rate_limited, operation, "HTTP rate limit exceeded", true};
+                    error.http = HttpErrorDetail{response.value().status};
+                    return error;
+                }
                 auto parsed = read_soap_operation(response.value().body, response_name);
                 if (!parsed)
                 {
@@ -886,14 +999,18 @@ namespace wlonvif
             std::shared_ptr<HttpTransport> transport_;
             std::shared_ptr<EndpointPolicy> policy_;
             std::shared_ptr<Runtime> runtime_;
-            std::optional<Credentials> credentials_;
+            std::shared_ptr<CredentialProvider> credential_provider_;
+            CancellationToken session_cancellation_;
             std::mutex capabilities_mutex_;
             bool capabilities_loaded_{};
             std::string media_url_;
             std::string ptz_url_;
             std::string event_url_;
             std::mutex event_mutex_;
-            std::string subscription_url_;
+            std::mutex legacy_mutex_;
+            std::map<std::string, PullPointSubscriptionInfo> subscriptions_;
+            std::uint64_t next_subscription_{1};
+            std::string legacy_subscription_;
             std::uint64_t next_sequence_{};
             std::mutex profile_mutex_;
             std::map<ProfileToken, std::string> ptz_configurations_;
@@ -906,7 +1023,8 @@ namespace wlonvif
         std::shared_ptr<HttpTransport> transport,
         std::shared_ptr<EndpointPolicy> endpoint_policy,
         std::shared_ptr<Runtime> runtime,
-        std::optional<Credentials> credentials
+        std::shared_ptr<CredentialProvider> credential_provider,
+        CancellationToken session_cancellation
     )
     {
         return std::make_shared<NetworkServiceBackend>(
@@ -914,7 +1032,8 @@ namespace wlonvif
             std::move(transport),
             std::move(endpoint_policy),
             std::move(runtime),
-            std::move(credentials)
+            std::move(credential_provider),
+            std::move(session_cancellation)
         );
     }
 } // namespace wlonvif

@@ -23,6 +23,10 @@ namespace wlonvif
         };
         std::map<ProfileToken, ProfileState> profiles;
         std::deque<Event> events;
+        std::optional<Error> next_move_error;
+        std::optional<Error> stop_error;
+        std::map<ProfileToken, std::size_t> stop_attempts;
+        std::chrono::milliseconds stop_delay{};
     };
     namespace
     {
@@ -198,6 +202,27 @@ namespace wlonvif
         std::lock_guard l(service_state_->mutex);
         service_state_->events.push_back(std::move(event));
     }
+    void VirtualDeviceTransport::fail_next_move(Error error)
+    {
+        std::lock_guard lock(service_state_->mutex);
+        service_state_->next_move_error = std::move(error);
+    }
+    void VirtualDeviceTransport::set_stop_failure(std::optional<Error> error)
+    {
+        std::lock_guard lock(service_state_->mutex);
+        service_state_->stop_error = std::move(error);
+    }
+    void VirtualDeviceTransport::set_stop_delay(std::chrono::milliseconds delay)
+    {
+        std::lock_guard lock(service_state_->mutex);
+        service_state_->stop_delay = std::max(delay, std::chrono::milliseconds::zero());
+    }
+    std::size_t VirtualDeviceTransport::stop_attempts(const ProfileToken& profile) const
+    {
+        std::lock_guard lock(service_state_->mutex);
+        const auto found = service_state_->stop_attempts.find(profile);
+        return found == service_state_->stop_attempts.end() ? 0 : found->second;
+    }
     Result<std::vector<MediaProfile>> VirtualDeviceTransport::profiles()
     {
         std::lock_guard l(service_state_->mutex);
@@ -260,6 +285,12 @@ namespace wlonvif
     VirtualDeviceTransport::move(const ProfileToken& t, PtzVector v, bool relative)
     {
         std::lock_guard l(service_state_->mutex);
+        if (service_state_->next_move_error)
+        {
+            auto error = std::move(*service_state_->next_move_error);
+            service_state_->next_move_error.reset();
+            return error;
+        }
         auto i = service_state_->profiles.find(t);
         if (i == service_state_->profiles.end())
         {
@@ -281,13 +312,19 @@ namespace wlonvif
         apply(i->second.status.position.tilt, v.tilt);
         apply(i->second.status.position.zoom, v.zoom);
         i->second.status.moving = true;
-        return MoveResult{true, {}};
+        return MoveResult{false, {}, {}};
     }
     Result<MoveResult> VirtualDeviceTransport::absolute_move(
         const ProfileToken& t, PtzVector position, std::optional<PtzVector>
     )
     {
         std::lock_guard l(service_state_->mutex);
+        if (service_state_->next_move_error)
+        {
+            auto error = std::move(*service_state_->next_move_error);
+            service_state_->next_move_error.reset();
+            return error;
+        }
         auto i = service_state_->profiles.find(t);
         if (i == service_state_->profiles.end())
         {
@@ -303,11 +340,17 @@ namespace wlonvif
         apply(i->second.status.position.tilt, position.tilt);
         apply(i->second.status.position.zoom, position.zoom);
         i->second.status.moving = true;
-        return MoveResult{true, {}};
+        return MoveResult{false, {}, {}};
     }
     Result<void> VirtualDeviceTransport::stop(const ProfileToken& t)
     {
-        std::lock_guard l(service_state_->mutex);
+        std::unique_lock l(service_state_->mutex);
+        ++service_state_->stop_attempts[t];
+        const auto delay = service_state_->stop_delay;
+        l.unlock();
+        if (delay > std::chrono::milliseconds::zero()) std::this_thread::sleep_for(delay);
+        l.lock();
+        if (service_state_->stop_error) return *service_state_->stop_error;
         auto i = service_state_->profiles.find(t);
         if (i == service_state_->profiles.end())
         {

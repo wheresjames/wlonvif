@@ -41,6 +41,54 @@ namespace wlonvif
         constexpr std::uint16_t DiscoveryPort = 3702;
         constexpr std::size_t MaximumDatagram = 64 * 1024;
 
+        Result<void> authorize_discovery(
+            const NetworkDiscoveryOptions& options,
+            DiscoveryAuthorizationRequest request,
+            std::chrono::steady_clock::time_point deadline,
+            const CancellationToken& cancellation
+        )
+        {
+            if (!options.authorizer)
+            {
+                return options.require_authorization
+                    ? Result<void>(Error{
+                          ErrorCategory::host_permission_denied,
+                          OperationId::discovery_probe,
+                          "discovery network authorization is unavailable"
+                      })
+                    : Result<void>{};
+            }
+            struct State
+            {
+                std::mutex mutex;
+                std::condition_variable ready;
+                std::optional<Result<void>> result;
+            };
+            auto state = std::make_shared<State>();
+            auto task = options.authorizer->authorize(
+                std::move(request), {deadline, cancellation}
+            );
+            std::move(task).start([state](Result<void> result)
+            {
+                {
+                    std::lock_guard lock(state->mutex);
+                    state->result.emplace(std::move(result));
+                }
+                state->ready.notify_one();
+            });
+            std::unique_lock lock(state->mutex);
+            while (!state->result && !cancellation.stop_requested() &&
+                   std::chrono::steady_clock::now() < deadline)
+                state->ready.wait_until(lock, deadline);
+            if (cancellation.stop_requested()) return Error{ErrorCategory::cancelled};
+            if (!state->result) return Error{ErrorCategory::timeout};
+            auto result = std::move(*state->result);
+            if (!result && result.error().category != ErrorCategory::cancelled &&
+                result.error().category != ErrorCategory::timeout)
+                result.error().category = ErrorCategory::host_permission_denied;
+            return result;
+        }
+
         class SocketRuntime
         {
           public:
@@ -374,7 +422,7 @@ namespace wlonvif
             }
         }
 
-        void ws_discover(
+        Result<void> ws_discover(
             const NetworkDiscoveryOptions& options,
             std::chrono::steady_clock::time_point deadline,
             const CancellationToken& cancellation,
@@ -384,7 +432,17 @@ namespace wlonvif
             SocketRuntime socket_runtime;
             if (!socket_runtime.valid())
             {
-                return;
+                return {};
+            }
+            if (options.interfaces.empty())
+            {
+                auto authorized = authorize_discovery(
+                    options,
+                    {DiscoveryNetworkAction::enumerate_interfaces, {}, {}, 0, {}},
+                    deadline,
+                    cancellation
+                );
+                if (!authorized) return authorized;
             }
             auto interfaces =
                 options.interfaces.empty() ? interface_addresses() : options.interfaces;
@@ -394,7 +452,7 @@ namespace wlonvif
                 const auto& interface_address = interfaces[interface_index];
                 if (cancellation.stop_requested() || std::chrono::steady_clock::now() >= deadline)
                 {
-                    return;
+                    return {};
                 }
                 report_progress(
                     options,
@@ -403,6 +461,27 @@ namespace wlonvif
                     interfaces.size(),
                     interface_address
                 );
+                auto bind_authorized = authorize_discovery(
+                    options,
+                    {DiscoveryNetworkAction::bind_udp, interface_address, {}, 0, {}},
+                    deadline,
+                    cancellation
+                );
+                if (!bind_authorized) return bind_authorized;
+                if (options.multicast)
+                {
+                    auto send_authorized = authorize_discovery(
+                        options,
+                        {DiscoveryNetworkAction::send_multicast,
+                         interface_address,
+                         std::string(MulticastAddress),
+                         DiscoveryPort,
+                         {}},
+                        deadline,
+                        cancellation
+                    );
+                    if (!send_authorized) return send_authorized;
+                }
                 SocketHandle socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                 if (socket == InvalidSocket)
                 {
@@ -493,9 +572,10 @@ namespace wlonvif
                     interface_address
                 );
             }
+            return {};
         }
 
-        void ws_unicast_discover(
+        Result<void> ws_unicast_discover(
             const NetworkDiscoveryOptions& options,
             std::chrono::steady_clock::time_point deadline,
             const CancellationToken& cancellation,
@@ -505,13 +585,30 @@ namespace wlonvif
             if (options.targets.empty() || cancellation.stop_requested() ||
                 std::chrono::steady_clock::now() >= deadline)
             {
-                return;
+                return {};
+            }
+            auto bind_authorized = authorize_discovery(
+                options,
+                {DiscoveryNetworkAction::bind_udp, "0.0.0.0", {}, 0, {}},
+                deadline,
+                cancellation
+            );
+            if (!bind_authorized) return bind_authorized;
+            for (const auto& target : options.targets)
+            {
+                auto send_authorized = authorize_discovery(
+                    options,
+                    {DiscoveryNetworkAction::send_unicast, {}, target, DiscoveryPort, {}},
+                    deadline,
+                    cancellation
+                );
+                if (!send_authorized) return send_authorized;
             }
             SocketRuntime socket_runtime;
             SocketHandle socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             if (!socket_runtime.valid() || socket == InvalidSocket)
             {
-                return;
+                return {};
             }
             sockaddr_in local{};
             local.sin_family = AF_INET;
@@ -520,7 +617,7 @@ namespace wlonvif
             if (bind(socket, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0)
             {
                 close_socket(socket);
-                return;
+                return {};
             }
             make_nonblocking(socket);
 
@@ -577,6 +674,7 @@ namespace wlonvif
                 options.maximum_results
             );
             close_socket(socket);
+            return {};
         }
 
         Result<std::vector<std::string>>
@@ -952,6 +1050,27 @@ namespace wlonvif
                             std::vector<std::string> scan_addresses;
                             if (!options.scan_networks.empty())
                             {
+                                for (const auto& network : options.scan_networks)
+                                {
+                                    auto authorized = authorize_discovery(
+                                        options,
+                                        {DiscoveryNetworkAction::scan_network,
+                                         {}, {}, 0, network},
+                                        call.deadline,
+                                        call.cancellation
+                                    );
+                                    if (!authorized)
+                                    {
+                                        result = authorized.error();
+                                        detail::dispatch(
+                                            runtime,
+                                            [completion = std::move(completion),
+                                             result = std::move(result)]() mutable
+                                            { completion(std::move(result)); }
+                                        );
+                                        return;
+                                    }
+                                }
                                 auto expanded =
                                     expand_networks(options.scan_networks, options.maximum_hosts);
                                 if (!expanded)
@@ -977,12 +1096,14 @@ namespace wlonvif
                                 scan_addresses.begin(),
                                 scan_addresses.end()
                             );
-                            ws_unicast_discover(
+                            auto unicast = ws_unicast_discover(
                                 discovery_options, call.deadline, call.cancellation, candidates
                             );
-                            ws_discover(
+                            if (!unicast) throw unicast.error();
+                            auto multicast = ws_discover(
                                 discovery_options, call.deadline, call.cancellation, candidates
                             );
+                            if (!multicast) throw multicast.error();
 
                             std::vector<std::string> addresses = options.targets;
                             addresses.insert(
@@ -1023,6 +1144,20 @@ namespace wlonvif
                             );
                             if (options.direct_probe && endpoint_policy)
                             {
+                                for (const auto& address : addresses)
+                                {
+                                    for (const auto port : options.ports)
+                                    {
+                                        auto authorized = authorize_discovery(
+                                            options,
+                                            {DiscoveryNetworkAction::connect_tcp,
+                                             {}, address, port, std::nullopt},
+                                            call.deadline,
+                                            call.cancellation
+                                        );
+                                        if (!authorized) throw authorized.error();
+                                    }
+                                }
                                 detail::initialize_curl();
                                 direct_probe(
                                     addresses,
@@ -1051,6 +1186,10 @@ namespace wlonvif
                                 }
                                 result = std::move(output);
                             }
+                        }
+                        catch (const Error& error)
+                        {
+                            result = error;
                         }
                         catch (const std::exception& error)
                         {

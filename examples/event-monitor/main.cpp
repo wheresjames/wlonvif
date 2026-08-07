@@ -83,7 +83,17 @@ int main(int argc, char** argv)
         std::cerr << session.error().message << '\n';
         return 1;
     }
-    auto stream = session.value()->events(256);
+    auto event_client = session.value()->event_client();
+    if (!event_client)
+    {
+        std::cerr << event_client.error().message << '\n';
+        return 1;
+    }
+    wlonvif::ManagedEventOptions event_options;
+    event_options.queue_capacity = 256;
+    auto stream = wlonvif::examples::wait_for_task(event_client.value()->open_managed_stream(
+        event_options, wlonvif::examples::call_options(common.timeout_seconds)
+    ));
     if (!stream)
     {
         std::cerr << stream.error().message << '\n';
@@ -92,59 +102,41 @@ int main(int argc, char** argv)
     std::size_t delivered = 0;
     while (count == 0 || delivered < count)
     {
-        auto polled = wlonvif::examples::wait_for_task(
-            stream.value()->poll(32, wlonvif::examples::call_options(common.timeout_seconds))
+        auto item = wlonvif::examples::wait_for_task(
+            stream.value()->next(wlonvif::examples::call_options(common.timeout_seconds))
         );
-        if (!polled)
+        if (!item)
         {
-            if (polled.error().category == wlonvif::ErrorCategory::cancelled) break;
-            std::cerr << "Event pull failed: " << polled.error().message << '\n';
-            auto marked = wlonvif::examples::wait_for_task(stream.value()->mark_reconnected(
-                wlonvif::examples::call_options(common.timeout_seconds)
-            ));
-            if (!marked) break;
+            if (item.error().category == wlonvif::ErrorCategory::cancelled) break;
+            if (item.error().category == wlonvif::ErrorCategory::timeout) continue;
+            std::cerr << "Event stream failed: " << item.error().message << '\n';
+            break;
+        }
+        if (const auto* health = std::get_if<wlonvif::StreamHealth>(&item.value()))
+        {
+            std::cerr << "Event stream health: "
+                      << (*health == wlonvif::StreamHealth::possible_event_loss
+                              ? "possible event loss"
+                              : "events dropped")
+                      << '\n';
             continue;
         }
-        for (;;)
+        const auto& event = std::get<wlonvif::Event>(item.value());
+        if (!topic_filter.empty() && event.topic.find(topic_filter) == std::string::npos)
+            continue;
+        if (common.json)
         {
-            auto item = wlonvif::examples::wait_for_task(
-                stream.value()->next(wlonvif::examples::call_options(1))
-            );
-            if (!item)
-            {
-                if (item.error().category == wlonvif::ErrorCategory::timeout) break;
-                goto finished;
-            }
-            if (const auto* health = std::get_if<wlonvif::StreamHealth>(&item.value()))
-            {
-                std::cerr << "Event stream health: "
-                          << (*health == wlonvif::StreamHealth::possible_event_loss
-                                  ? "possible event loss"
-                                  : "events dropped")
-                          << '\n';
-                continue;
-            }
-            const auto& event = std::get<wlonvif::Event>(item.value());
-            if (!topic_filter.empty() && event.topic.find(topic_filter) == std::string::npos)
-                continue;
-            if (common.json)
-            {
-                std::cout << "{\"topic\":\"" << wlonvif::examples::json_escape(event.topic)
-                          << "\",\"source\":\""
-                          << wlonvif::examples::json_escape(event.source) << "\",\"data\":\""
-                          << wlonvif::examples::json_escape(event.data) << "\",\"sequence\":"
-                          << event.sequence << "}\n";
-            }
-            else
-            {
-                std::cout << event.sequence << "  " << event.topic << "  " << event.source
-                          << "  " << event.data << '\n';
-            }
-            ++delivered;
-            if (count && delivered >= count) goto finished;
+            std::cout << "{\"topic\":\"" << wlonvif::examples::json_escape(event.topic)
+                      << "\",\"source\":\""
+                      << wlonvif::examples::json_escape(event.source) << "\",\"data\":\""
+                      << wlonvif::examples::json_escape(event.data) << "\",\"sequence\":"
+                      << event.sequence << "}\n";
         }
+        else
+            std::cout << event.sequence << "  " << event.topic << "  " << event.source
+                      << "  " << event.data << '\n';
+        ++delivered;
     }
-finished:
     auto closed = wlonvif::examples::wait_for_task(
         stream.value()->close(wlonvif::examples::safety_call_options(5))
     );

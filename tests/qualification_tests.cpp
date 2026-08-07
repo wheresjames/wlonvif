@@ -30,6 +30,23 @@ namespace
             CancellationSource{}.token()
         };
     }
+
+    class DenyingDiscoveryAuthorizer final : public DiscoveryAuthorizer
+    {
+      public:
+        Task<Result<void>> authorize(
+            DiscoveryAuthorizationRequest request, CallOptions
+        ) override
+        {
+            actions.push_back(request.action);
+            return Task<Result<void>>([](auto done)
+            {
+                done(Error{ErrorCategory::authorization, OperationId::discovery_probe,
+                           "denied by test policy"});
+            });
+        }
+        std::vector<DiscoveryNetworkAction> actions;
+    };
 } // namespace
 
 #define REQUIRE(expression)                                                                        \
@@ -72,6 +89,29 @@ int main()
     auto runtime_result = Runtime::create();
     REQUIRE(runtime_result);
     auto runtime = runtime_result.value();
+
+    // Discovery can be made fail-closed before any socket is created.
+    {
+        NetworkDiscoveryOptions discovery;
+        discovery.multicast = false;
+        discovery.targets = {"127.0.0.1"};
+        discovery.require_authorization = true;
+        auto unavailable = wait_for_task(discover_devices(
+            runtime, make_same_host_policy(), discovery, options()
+        ));
+        REQUIRE(!unavailable);
+        REQUIRE(unavailable.error().category == ErrorCategory::host_permission_denied);
+
+        auto authorizer = std::make_shared<DenyingDiscoveryAuthorizer>();
+        discovery.authorizer = authorizer;
+        auto denied = wait_for_task(discover_devices(
+            runtime, make_same_host_policy(), discovery, options()
+        ));
+        REQUIRE(!denied);
+        REQUIRE(denied.error().category == ErrorCategory::host_permission_denied);
+        REQUIRE(!authorizer->actions.empty());
+        REQUIRE(authorizer->actions.front() == DiscoveryNetworkAction::bind_udp);
+    }
     auto device = std::make_shared<VirtualDeviceTransport>(
         runtime,
         DeviceInformation{"Test", "Qualified", "0.1", "1", "1"},

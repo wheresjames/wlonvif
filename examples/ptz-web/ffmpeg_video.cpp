@@ -3,6 +3,8 @@
 #include <cerrno>
 #include <cstring>
 #include <vector>
+#include <chrono>
+#include <thread>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -119,10 +121,30 @@ namespace wlonvif::examples::ptz_web
     FfmpegVideo::~FfmpegVideo()
     {
 #ifndef _WIN32
-        if (process_ > 0) kill(process_, SIGTERM);
-        if (output_ >= 0) close(output_);
+        if (process_ > 0)
+        {
+            (void)kill(process_, SIGTERM);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            int status = 0;
+            while (std::chrono::steady_clock::now() < deadline)
+            {
+                const auto waited = waitpid(process_, &status, WNOHANG);
+                if (waited == process_ || (waited < 0 && errno == ECHILD))
+                {
+                    process_ = -1;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            if (process_ > 0)
+            {
+                (void)kill(process_, SIGKILL);
+                while (waitpid(process_, &status, 0) < 0 && errno == EINTR) {}
+                process_ = -1;
+            }
+        }
+        if (output_ >= 0) { close(output_); output_ = -1; }
         if (reader_.joinable()) reader_.join();
-        if (process_ > 0) (void)waitpid(process_, nullptr, 0);
 #endif
     }
 }

@@ -13,6 +13,12 @@
 #include <mutex>
 #include <thread>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#endif
+
 namespace wlonvif::examples::ptz_web
 {
     namespace asio = boost::asio;
@@ -68,6 +74,41 @@ namespace wlonvif::examples::ptz_web
 
     struct WebServer::Impl
     {
+        struct Connection
+        {
+            using NativeHandle = tcp::socket::native_handle_type;
+            std::mutex mutex;
+#ifdef _WIN32
+            NativeHandle handle{INVALID_SOCKET};
+#else
+            NativeHandle handle{-1};
+#endif
+
+            void bind(tcp::socket& socket)
+            {
+                std::lock_guard lock(mutex);
+                handle = socket.native_handle();
+            }
+            void clear()
+            {
+                std::lock_guard lock(mutex);
+#ifdef _WIN32
+                handle = INVALID_SOCKET;
+#else
+                handle = -1;
+#endif
+            }
+            void interrupt() noexcept
+            {
+                std::lock_guard lock(mutex);
+#ifdef _WIN32
+                if (handle != INVALID_SOCKET) ::shutdown(handle, SD_BOTH);
+#else
+                if (handle >= 0) ::shutdown(handle, SHUT_RDWR);
+#endif
+            }
+        };
+
         WebServerConfig config;
         ControlProtocol protocol;
         CommandHandler command;
@@ -83,8 +124,10 @@ namespace wlonvif::examples::ptz_web
               disconnect(std::move(gone)) {}
 
         template<class Stream>
-        void serve(Stream stream, bool secure)
+        void serve(Stream stream, bool secure, const std::shared_ptr<Connection>& connection)
         {
+            connection->bind(beast::get_lowest_layer(stream).socket());
+            beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
             beast::flat_buffer buffer;
             http::request_parser<http::string_body> parser;
             parser.header_limit(8192);
@@ -102,6 +145,7 @@ namespace wlonvif::examples::ptz_web
                     if (!protocol.origin_allowed(origin) || session.empty()) return;
                 }
                 websocket::stream<Stream> ws(std::move(stream));
+                connection->bind(beast::get_lowest_layer(ws).socket());
                 websocket::stream_base::timeout timeout{
                     config.protocol.lease, config.protocol.lease, false};
                 ws.set_option(timeout);
@@ -261,7 +305,12 @@ namespace wlonvif::examples::ptz_web
         acceptor.listen(static_cast<int>(impl_->config.maximum_connections), error);
         if (error) return server_error(error.message());
         acceptor.non_blocking(true, error);
-        struct Worker { std::thread thread; std::shared_ptr<std::atomic_bool> done; };
+        struct Worker
+        {
+            std::thread thread;
+            std::shared_ptr<std::atomic_bool> done;
+            std::shared_ptr<Impl::Connection> connection;
+        };
         std::vector<Worker> workers;
         while (!stop_requested.load())
         {
@@ -290,22 +339,31 @@ namespace wlonvif::examples::ptz_web
             ++impl_->active_connections;
             auto impl = impl_;
             auto done = std::make_shared<std::atomic_bool>();
-            workers.push_back({std::thread([impl, socket = std::move(socket), secure, done]() mutable
+            auto connection = std::make_shared<Impl::Connection>();
+            // Publish an interruptible native handle before the worker starts. A
+            // signal can otherwise arrive between thread creation and its first
+            // instruction, leaving shutdown with no descriptor to wake.
+            connection->bind(socket);
+            workers.push_back({std::thread([impl, socket = std::move(socket), secure, done, connection]() mutable
             {
                 if (secure)
                 {
                     beast::ssl_stream<beast::tcp_stream> stream(std::move(socket), impl->tls);
+                    connection->bind(beast::get_lowest_layer(stream).socket());
+                    beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(5));
                     beast::error_code handshake;
                     stream.handshake(asio::ssl::stream_base::server, handshake);
-                    if (!handshake) impl->serve(std::move(stream), true);
+                    if (!handshake) impl->serve(std::move(stream), true, connection);
                 }
-                else impl->serve(beast::tcp_stream(std::move(socket)), false);
+                else impl->serve(beast::tcp_stream(std::move(socket)), false, connection);
+                connection->clear();
                 --impl->active_connections;
                 done->store(true);
-            }), done});
+            }), done, connection});
         }
         acceptor.close();
         impl_->shutting_down.store(true);
+        for (auto& worker : workers) worker.connection->interrupt();
         for (auto& worker : workers) if (worker.thread.joinable()) worker.thread.join();
         {
             std::lock_guard lock(impl_->protocol_mutex);

@@ -12,6 +12,7 @@ namespace
         Task<Result<HttpResponse>> send(HttpRequest request, CancellationToken) override
         {
             credentials = std::move(request.credentials);
+            credential_lease = std::move(request.credential_lease);
             return Task<Result<HttpResponse>>(
                 [response = response_](auto completion) mutable
                 {
@@ -20,6 +21,7 @@ namespace
             );
         }
         std::optional<Credentials> credentials;
+        std::shared_ptr<CredentialLease> credential_lease;
 
       private:
         HttpResponse response_;
@@ -162,8 +164,10 @@ int main()
     }));
     CHECK(!unauthorized);
     CHECK(unauthorized.error().category == ErrorCategory::authentication);
-    CHECK(unauthorized_transport->credentials);
-    CHECK(unauthorized_transport->credentials->username == "example-user");
+    CHECK(!unauthorized_transport->credentials);
+    CHECK(unauthorized_transport->credential_lease);
+    CHECK(unauthorized_transport->credential_lease->username() == "example-user");
+    CHECK(unauthorized.error().http && unauthorized.error().http->status == 401);
 
     auto forbidden_transport = std::make_shared<FixedTransport>(HttpResponse{403, {}, {}});
     auto forbidden_session = wait(DeviceSession::connect(

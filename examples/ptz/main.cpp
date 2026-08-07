@@ -206,7 +206,8 @@ int main(int argc, char** argv)
         auto result = relative
                           ? wlonvif::examples::wait_for_task(ptz.value()->relative_move(profile, vector, options))
                           : wlonvif::examples::wait_for_task(ptz.value()->continuous_move(profile, vector, options));
-        if (!relative && result) std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
+        if (!relative && result)
+            (void)wlonvif::examples::interruptible_wait(std::chrono::milliseconds(duration_ms));
         if (!relative)
         {
             auto stopped = wlonvif::examples::wait_for_task(ptz.value()->emergency_stop(profile, options));
@@ -228,7 +229,8 @@ int main(int argc, char** argv)
             ptz.value()->continuous_move(profile, vector, qualify_options())
         );
         const auto move_completed = std::chrono::steady_clock::now();
-        if (moved) std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
+        if (moved)
+            (void)wlonvif::examples::interruptible_wait(std::chrono::milliseconds(duration_ms));
         const auto stop_started = std::chrono::steady_clock::now();
         auto stopped = wlonvif::examples::wait_for_task(
             ptz.value()->emergency_stop(profile, qualify_options())

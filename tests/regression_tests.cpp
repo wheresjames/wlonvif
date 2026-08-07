@@ -721,6 +721,48 @@ int main()
         CHECK(called.load());
     }
 
+    // ---- Runtime may be released by work executing on its own worker ----
+    {
+        auto self_releasing = Runtime::create().value();
+        std::weak_ptr<Runtime> lifetime = self_releasing;
+        CHECK(self_releasing->post([keep_alive = self_releasing] {}));
+        self_releasing.reset();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!lifetime.expired() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(lifetime.expired());
+    }
+
+    // ---- The positional connect overload validates inputs and deadlines ----
+    {
+        auto invalid = sync(DeviceSession::connect(
+            "http://camera/onvif/device_service",
+            {},
+            make_same_host_policy(),
+            runtime,
+            std::nullopt,
+            options()
+        ));
+        CHECK(!invalid && invalid.error().category == ErrorCategory::invalid_argument);
+
+        auto device = std::make_shared<VirtualDeviceTransport>(
+            runtime, DeviceInformation{}, std::vector<std::string>{},
+            std::vector<Service>{}, Capabilities{}
+        );
+        auto expired_options = options();
+        expired_options.deadline = std::chrono::steady_clock::now() -
+                                   std::chrono::milliseconds(1);
+        auto expired = sync(DeviceSession::connect(
+            "http://camera/onvif/device_service",
+            device,
+            make_same_host_policy(),
+            runtime,
+            std::nullopt,
+            expired_options
+        ));
+        CHECK(!expired && expired.error().category == ErrorCategory::timeout);
+    }
+
 #ifndef _WIN32
     // ---- A spoofed ProbeMatch cannot redirect the caller to a foreign host ----
     {

@@ -1,71 +1,322 @@
 /**
  * @mainpage wlonvif C++ API
  *
- * `wlonvif` is a C++20 library for ONVIF Device, Media, PTZ, discovery, events,
- * and deterministic virtual-device testing.
+ * @section overview Overview
  *
- * @section getting_started Getting started
+ * `wlonvif` is a C++20 client library for selected ONVIF Device, Media1, PTZ,
+ * PullPoint Event, and discovery workflows. It favors a compact typed API,
+ * explicit resource bounds, deterministic lifecycle behavior, and testability over
+ * generated bindings for the complete ONVIF schema family.
  *
- * Create a Runtime, transport, and endpoint policy, then consume the cold task
- * returned by DeviceSession::connect(). Every asynchronous network operation takes
- * CallOptions containing an absolute monotonic deadline and cancellation token.
+ * The library provides:
+ *
+ * - Device identity, UTC time, scopes, services, and capabilities;
+ * - Media1 profile, stream URI, snapshot URI, and bounded download workflows;
+ * - normalized PTZ spaces, status, movement, Stop, emergency Stop, and presets;
+ * - a stateful manual PTZ controller and calibrated viewport movement mapping;
+ * - IPv4 WS-Discovery plus bounded targeted and CIDR direct probing;
+ * - PullPoint subscription management, bounded event queues, and continuity health;
+ * - challenge-driven HTTP and WS-Security authentication;
+ * - endpoint and resolved-address authorization boundaries;
+ * - bounded SOAP/XML parsing and structured errors; and
+ * - an in-process virtual Device/Media/PTZ/Event backend for tests.
+ *
+ * This is not a Media2, Imaging, Analytics, Recording, Replay, codec, RTP/RTSP
+ * playback, general ONVIF server, or conformance-certification implementation.
+ * Cameras differ substantially by model and firmware, so deployments must qualify
+ * the exact operations they depend on.
+ *
+ * @section architecture Architecture
+ *
+ * Applications normally assemble the client in four layers:
+ *
+ * @verbatim
+ * application / UI / service
+ *          |
+ *      DeviceSession  ---- lifecycle, credentials, child cancellation, PTZ safety
+ *       /    |    \
+ *  Device  Media1   PTZ / Events
+ *          |
+ * HttpTransport ---- EndpointPolicy ---- optional CandidateAuthorizer
+ *          |
+ *       Runtime  ---- completion dispatch and bounded shutdown participation
+ * @endverbatim
+ *
+ * Runtime owns completion dispatch. HttpTransport performs HTTP(S) work.
+ * EndpointPolicy authorizes advertised URLs before requests are constructed.
+ * CandidateAuthorizer, when configured through CurlTransportOptions, authorizes
+ * the resolved address set immediately before connection. DeviceSession owns the
+ * connected Device endpoint and creates MediaClient, PtzClient, and
+ * ManagedEventStream objects that share its backend and cancellation state.
+ *
+ * The public header is:
  *
  * @code{.cpp}
- * auto runtime_result = wlonvif::Runtime::create();
- * if (!runtime_result) {
- *     return 1;
- * }
- *
- * auto runtime = runtime_result.value();
- * auto transport = wlonvif::make_curl_transport(runtime);
- * auto policy = wlonvif::make_same_origin_policy();
+ * #include <wlonvif/wlonvif.hpp>
  * @endcode
  *
- * @section components Components
+ * @section getting_started Connecting a session
  *
- * - DeviceSession exposes Device operations and service-specific clients.
- * - MediaClient retrieves Media1 profiles and media URIs.
- * - PtzClient controls movement, status, Stop, and presets.
- * - DiscoverySession provides bounded discovery observations.
- * - ManagedEventStream provides bounded events and continuity health signals.
- * - VirtualDeviceTransport supplies deterministic test behavior.
+ * Prefer DeviceSessionOptions for new code because it groups validated ownership,
+ * policy, credential, and call-lifetime inputs:
  *
- * @section safety Safety model
+ * @code{.cpp}
+ * using namespace std::chrono_literals;
  *
- * Inputs are bounded by XmlLimits, advertised endpoints require EndpointPolicy
- * authorization, tasks complete once, and cancellation can report uncertain outcomes
- * for operations that may already have reached a device.
+ * auto created = wlonvif::Runtime::create();
+ * if (!created) {
+ *     // Inspect created.error().category and created.error().message.
+ *     return;
+ * }
+ * auto runtime = created.value();
  *
- * @section examples Real-device examples
+ * wlonvif::CurlTransportOptions transport_options;
+ * transport_options.runtime = runtime;
+ * transport_options.limits = wlonvif::XmlLimits{};
+ * auto transport = wlonvif::make_curl_transport(std::move(transport_options));
  *
- * Build with `WLONVIF_BUILD_EXAMPLES=ON`. The suite includes robust discovery,
- * read-only Device inspection, concurrent inventory, endpoint-policy evaluation,
- * and a deterministic virtual-device workflow. Shared support supplies deadlines,
- * JSON escaping, URL redaction, and password input that avoids process arguments.
- * See `README.md` and `WLO-EXAMPLES.md` for usage and the implementation roadmap.
- * Network Device sessions also provide Media1 profiles and URIs, normalized PTZ
- * operations, and managed PullPoint Event streams. The media example can copy a
- * bounded snapshot without decoding it; video playback remains delegated to an
- * external RTSP player.
+ * wlonvif::DeviceSessionOptions session_options;
+ * session_options.device_url = "https://camera/onvif/device_service";
+ * session_options.transport = std::move(transport);
+ * session_options.endpoint_policy = wlonvif::make_same_host_policy();
+ * session_options.runtime = runtime;
+ * session_options.credential_provider =
+ *     wlonvif::make_fixed_credential_provider({"operator", "password", false});
+ * session_options.call = {
+ *     std::chrono::steady_clock::now() + 10s,
+ *     wlonvif::CancellationSource{}.token()
+ * };
  *
- * The operational examples add aggregate camera health, bounded multi-camera
- * inspection, optional inventory service columns, printable FFmpeg stream-copy
- * commands, and explicitly confirmed preset tours. Discovery cannot guarantee that
- * multicast-disabled devices will answer; RTSP playback/recording needs an external
- * media stack; TLS certificate verification remains enabled; and vendor behavior can
- * differ. Manual results belong in `docs/compatibility-matrix.md` while ordinary CI
- * stays hardware-independent.
- * Example credentials use command-line values first, then `WLONVIF_USERNAME` and
- * `WLONVIF_PASSWORD`. Anonymous access is tried when neither is present; an HTTP or
- * SOAP authentication failure on an interactive terminal triggers a username and
- * no-echo password prompt followed by one retry. Command-line passwords may be
- * exposed by shell history or process inspection, so environment, protected-file,
- * or prompt input is preferable outside disposable tests.
- * Real-device examples also accept `--ip ADDRESS`; shared support performs targeted
- * library discovery to learn the Device service URL and nonstandard port. `--url`
- * remains the mutually exclusive explicit override.
- * The PTZ diagnostic example exposes bounded individual operations rather than an
- * interactive terminal controller. Applications that need natural manual control
- * should use `PtzController`, which owns input leases, shaping, ramps, command
- * pacing, zoom-aware scaling, watchdog behavior, and Stop/close safety.
+ * auto connection = wlonvif::DeviceSession::connect(std::move(session_options));
+ * std::move(connection).start([](auto result) {
+ *     if (!result) {
+ *         // Use result.error().category for control flow.
+ *         return;
+ *     }
+ *     auto session = result.value();
+ *     // Retain session and consume its asynchronous operations.
+ * });
+ * @endcode
+ *
+ * A Task is cold: merely constructing it performs no work. It is move-only and
+ * single-consumer; start it exactly once with `std::move(task).start(completion)`.
+ * A completion may be dispatched by Runtime or run inline if shutdown has already
+ * stopped queue admission. Applications that require a particular UI or event-loop
+ * thread should marshal the completion through their own executor.
+ *
+ * @section result_model Results, deadlines, and cancellation
+ *
+ * Every asynchronous public operation returns `Task<Result<T>>`.
+ *
+ * - Test Result before accessing `value()` or `error()`.
+ * - Use Error::category and Error::operation for program logic. Error::message is
+ *   owned, redacted diagnostic prose and is not a stable protocol.
+ * - CallOptions::deadline is an absolute `std::chrono::steady_clock` time point.
+ * - CancellationSource owns cancellation state; CancellationToken is a cheap,
+ *   copyable observation view.
+ * - DeviceSession links each caller token with its session cancellation source.
+ * - Caller-visible DNS resolution, candidate authorization, HTTP, SOAP, and
+ *   service work observe cancellation and deadlines.
+ *
+ * Cancellation cannot retract a request already accepted by a device. Error and
+ * MoveResult therefore preserve uncertain-delivery information. Do not blindly
+ * retry a non-idempotent PTZ movement after timeout or cancellation.
+ *
+ * Error optionally owns typed HttpErrorDetail, SoapFaultDetail,
+ * HostPermissionDetail, and SafetyActionDetail records. SOAP detail strings are
+ * bounded. HTTP 401, 403, and 429 and recognized SOAP busy/rate-limit signals are
+ * classified without requiring callers to parse diagnostic strings.
+ *
+ * @section lifecycle Session and runtime lifecycle
+ *
+ * DeviceSession is thread-safe and follows one authoritative state machine:
+ *
+ * @verbatim
+ * open  ->  closing  ->  closed
+ * @endverbatim
+ *
+ * DeviceSession::close() is idempotent. It rejects new operations, requests child
+ * cancellation, closes the credential provider without holding session state
+ * locks, runs bounded PTZ safety cleanup, and settles all waiters once active native
+ * accounting completes. CloseResult reports whether cleanup and safety completed
+ * inside the caller's budget. A budget expiry does not abandon internal accounting
+ * or reopen the session.
+ *
+ * Consume `close()` whenever the final result matters. Destruction is a
+ * non-blocking cancellation and resource-release backstop. Runtime::shutdown()
+ * stops new completion admission, invokes registered bounded cleanup, drains
+ * accepted work, and terminates its worker safely. It is idempotent and safe when
+ * called concurrently or from a runtime completion.
+ *
+ * @section security Transport and credential security
+ *
+ * Endpoint authorization has two distinct layers:
+ *
+ * 1. EndpointPolicy checks an advertised URL relative to the original Device URL.
+ *    `make_same_host_policy()` accepts HTTP(S) service endpoints on another port of
+ *    the same host. `make_same_origin_policy()` also requires the original port.
+ *    Both reject user-info and unrelated hosts.
+ * 2. CandidateAuthorizer receives the normalized hostname and port, complete
+ *    resolved-address set, proposed address, original/effective URLs, endpoint
+ *    purpose and provenance, operation metadata, and an opaque attempt ID. The
+ *    transport connects only after approval and pins the approved address with
+ *    libcurl to prevent an unchecked second resolution.
+ *
+ * DNS candidate resolution observes the request deadline and cancellation token.
+ * Redirect following is disabled. HTTPS certificate and hostname verification are
+ * left enabled. Challenge parsing is token-aware: the transport sends no HTTP
+ * credentials until the server advertises a supported authentication scheme.
+ * HTTP Basic over unencrypted HTTP requires explicit
+ * Credentials::allow_cleartext_basic opt-in.
+ *
+ * CredentialProvider supplies independent, move-only CredentialLease values.
+ * Provider close rejects new acquisition and best-effort erases provider buffers;
+ * lease destruction best-effort erases lease buffers. Erasure is not a forensic
+ * guarantee because allocators, TLS libraries, operating systems, or devices may
+ * retain copies outside the API's ownership.
+ *
+ * XmlLimits bounds HTTP body bytes, XML depth, nodes, attributes, and cumulative
+ * text. Binary downloads add their own caller-selected byte bound. Discovery and
+ * event queues, discovery host/concurrency counts, authentication headers, and the
+ * optional PTZ web protocol are bounded independently.
+ *
+ * @section device_services Device, Media, PTZ, and Events
+ *
+ * A connected DeviceSession directly exposes Device operations:
+ *
+ * - DeviceSession::get_device_information()
+ * - DeviceSession::get_system_date_and_time()
+ * - DeviceSession::get_scopes()
+ * - DeviceSession::get_services()
+ * - DeviceSession::get_capabilities()
+ *
+ * DeviceSession::media() returns MediaClient for Media1 profiles and stream or
+ * snapshot URIs. `download_binary()` retrieves authorized bounded opaque content;
+ * it does not decode images.
+ *
+ * DeviceSession::ptz() returns PtzClient. Public positions, translations, and
+ * velocities use normalized `[-1,+1]` coordinates and retain the device's native
+ * advertised space metadata in PtzSpaces. Available operations include continuous,
+ * relative, and absolute movement, status, ordinary Stop, urgent emergency Stop,
+ * preset enumeration, and preset navigation.
+ *
+ * DeviceSession::event_client() returns EventClient. `create_pullpoint()` exposes
+ * explicit create, pull, renew, unsubscribe, state, and bounded-close operations on
+ * an independent PullPointSubscription. `open_managed_stream()` starts a polling
+ * worker which renews before expiry, reconnects with bounded exponential backoff,
+ * and reports possible continuity loss in band. Its local queue is bounded and
+ * reports overflow with StreamHealth::events_dropped. Consume `close()` to stop the
+ * worker and unsubscribe deterministically. DeviceSession::events() remains the
+ * manual polling interface for compatibility.
+ *
+ * @section ptz_control Stateful and viewport PTZ control
+ *
+ * PtzController turns non-blocking manual input into bounded-rate PtzClient calls.
+ * Its validated PtzControllerConfig controls ownership leases, dead zone and
+ * response curves, host or firmware ramping, command interval and refresh,
+ * minimum effective speed, maximum run duration, zoom-aware speed, soft limits,
+ * keep-out zones, and status polling. It coalesces input to the latest intent and
+ * retains no unbounded command queue. Focus loss, stale ownership, explicit Stop,
+ * close, or watchdog expiry converge on an urgent Stop.
+ *
+ * ViewportMapper converts validated click or drag geometry into conservative
+ * relative movement. ViewportCalibration supports content cropping, rotation,
+ * mirroring, bounded translation, calibration age, direction-specific gains, and
+ * interpolation across normalized zoom samples. PtzSettlingDetector provides a
+ * small deterministic arrival-state helper for automatic operations.
+ *
+ * DeviceSession also maintains a PTZ movement safety ledger by profile. Accepted or
+ * uncertain movement remains tracked until a successful applicable Stop or reliable
+ * stopped status clears it. Session and runtime shutdown perform a bounded Stop
+ * sweep; a failed safety Stop is retained structurally rather than replacing the
+ * initiating operation's result.
+ *
+ * @section discovery Discovery
+ *
+ * `discover_devices()` combines configured discovery strategies into bounded,
+ * deduplicated DeviceCandidate results. NetworkDiscoveryOptions controls multicast
+ * interfaces, targeted unicast, direct common-path probing, explicit CIDRs,
+ * concurrency, host limits, result limits, probe types, and progress reporting.
+ * `local_ipv4_networks()` returns eligible directly connected IPv4 networks subject
+ * to a host bound.
+ *
+ * DiscoveryAuthorizer is the pre-socket permission boundary for interface
+ * enumeration, UDP binds and sends, explicit CIDR scans, and direct TCP targets.
+ * Enable NetworkDiscoveryOptions::require_authorization in restricted hosts so a
+ * missing authorizer fails with host_permission_denied before socket creation.
+ *
+ * Discovery evidence records how each candidate was observed. Multicast depends on
+ * interface, firewall, routing, and camera behavior; known targets and explicitly
+ * authorized CIDR scans are important fallbacks. Only scan networks for which the
+ * operator has permission.
+ *
+ * DiscoverySession is a deterministic bounded observation queue used by tests and
+ * adapters. It is not the network discovery entry point; use `discover_devices()`
+ * for batch network discovery. LibraryFeatures::discovery_streaming describes a
+ * separate embedding contract and is not a claim that batch discovery is absent.
+ *
+ * @section virtual_device Deterministic testing
+ *
+ * VirtualDeviceTransport implements HttpTransport and ServiceBackend without
+ * opening sockets. Tests can configure identity, scopes, services, capabilities,
+ * Media profiles and URIs, PTZ spaces and presets, artificial delay, forced errors,
+ * and Event emission. It is intended for unit tests and application development,
+ * not as a network-visible ONVIF server or conformance simulator.
+ *
+ * The project test matrix covers static and shared builds, warnings-as-errors,
+ * AddressSanitizer/UndefinedBehaviorSanitizer, ThreadSanitizer, install/package
+ * consumption, XML fuzz smoke tests, and optional web-protocol fuzzing. Ordinary
+ * tests are hardware-independent; real-device behavior requires an explicit smoke
+ * or qualification run.
+ *
+ * @section build Linking and packaging
+ *
+ * The installed CMake package exports:
+ *
+ * - `wlonvif::core` for runtime, task/result, XML/SOAP, security, and shared types;
+ * - `wlonvif::client` for HTTP transport, discovery, service clients, PTZ control,
+ *   and viewport mapping; and
+ * - `wlonvif::device` for VirtualDeviceTransport.
+ *
+ * @code{.cmake}
+ * find_package(wlonvif 0.1 CONFIG REQUIRED)
+ * add_executable(camera_app main.cpp)
+ * target_link_libraries(camera_app PRIVATE wlonvif::client)
+ * target_compile_features(camera_app PRIVATE cxx_std_20)
+ * @endcode
+ *
+ * Core requirements are CMake 3.24, C++20, libcurl 8, libxml2 2.9, OpenSSL 3,
+ * and platform threads. SDL3, Boost.Beast, and FFmpeg belong only to optional
+ * examples and are not dependencies of the installed client libraries.
+ *
+ * `library_version()` returns the native semantic version. `library_features()`
+ * exposes embedding-contract readiness for candidate authorization, credential
+ * providers, deterministic close, PTZ safety, PullPoint integration, and streaming
+ * discovery. These flags are intended for adapters that must reject an incompatible
+ * native library at startup; some flags describe a stricter adapter contract than
+ * the presence of lower-level API operations.
+ *
+ * @section examples Examples and further guidance
+ *
+ * Build dependency-light examples with `WLONVIF_BUILD_EXAMPLES=ON`. They cover
+ * discovery, Device inspection, inventory, endpoint policy, virtual-device usage,
+ * Media URIs and snapshots, PTZ diagnostics, PullPoint monitoring, camera health,
+ * and bounded multi-camera inspection.
+ *
+ * `WLONVIF_BUILD_PTZ_CONTROL=ON` adds the SDL3 native keyboard/gamepad frontend.
+ * `WLONVIF_BUILD_PTZ_WEB=ON` adds the loopback-first Boost.Beast browser frontend.
+ * Both keep movement policy in PtzController and require explicit confirmation for
+ * live movement. The browser example additionally documents its authenticated
+ * session protocol, TLS/Origin boundary, optional FFmpeg MJPEG bridge, calibrated
+ * viewport movement, and orderly interruption of stalled clients.
+ *
+ * Consult the repository documents for operational detail:
+ *
+ * - `README.md` — build options, all command-line examples, installation, real
+ *   device smoke testing, comparisons, and deployment cautions;
+ * - `docs/session-security.md` — lifecycle, transport, credential, error, and PTZ
+ *   safety contracts;
+ * - `docs/ptz-control.md` — SDL mapping, calibration, safety, and qualification; and
+ * - `docs/ptz-web.md` — browser protocol, FFmpeg bridge, calibration, remote threat
+ *   model, and limitations.
  */

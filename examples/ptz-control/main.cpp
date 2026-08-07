@@ -145,7 +145,7 @@ int main(int argc, char** argv)
     std::array<double, 3> calibration_min{1, 1, 1};
     std::array<double, 3> calibration_max{-1, -1, -1};
     bool running = true;
-    while (running)
+    while (running && !wlonvif::examples::shutdown_requested())
     {
         running = input.poll(model);
         const auto intent = model.intent();

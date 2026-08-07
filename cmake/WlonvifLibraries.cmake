@@ -21,6 +21,7 @@ add_library(wlonvif_client
   ${PROJECT_SOURCE_DIR}/src/discovery.cpp
   ${PROJECT_SOURCE_DIR}/src/network_services.cpp
   ${PROJECT_SOURCE_DIR}/src/ptz_controller.cpp
+  ${PROJECT_SOURCE_DIR}/src/ptz_safety.cpp
   ${PROJECT_SOURCE_DIR}/src/ptz_viewport.cpp
   ${PROJECT_SOURCE_DIR}/src/services.cpp)
 add_library(wlonvif::client ALIAS wlonvif_client)

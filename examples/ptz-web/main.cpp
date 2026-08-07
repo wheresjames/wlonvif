@@ -417,7 +417,7 @@ int main(int argc, char** argv)
                         ptz->goto_preset(active_profile, preset, call()));
                     if (!result) return result.error();
                     const auto end = std::chrono::steady_clock::now() + command.dwell;
-                    while (std::chrono::steady_clock::now() < end)
+                    while (std::chrono::steady_clock::now() < end && !stop_requested.load())
                     {
                         if (generation != operation_generation.load())
                             return Error{ErrorCategory::cancelled, OperationId::goto_preset,

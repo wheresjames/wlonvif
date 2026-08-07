@@ -9,18 +9,19 @@ normalized PTZ control, WS-Discovery and direct network probing, PullPoint event
 bounded SOAP/XML processing, endpoint authorization, and authenticated HTTP
 transport.
 
-> **Project status:** `wlonvif` is under active development. Test with the devices
-> and firmware versions you intend to deploy, because ONVIF implementations vary
-> considerably between vendors.
-
 ## Table of contents
 
 - [Highlights](#highlights)
+- [Supported scope](#supported-scope)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Build options](#build-options)
 - [Testing](#testing)
 - [Using the library](#using-the-library)
+  - [Task and result model](#task-and-result-model)
+  - [Session lifecycle](#session-lifecycle)
+  - [Transport and endpoint authorization](#transport-and-endpoint-authorization)
+  - [Errors and uncertain outcomes](#errors-and-uncertain-outcomes)
 - [Connecting to real devices](#connecting-to-real-devices)
   - [Device addresses](#device-addresses)
   - [Credentials](#credentials)
@@ -38,6 +39,7 @@ transport.
   - [Inspect multiple cameras](#inspect-multiple-cameras)
 - [Real-device smoke testing](#real-device-smoke-testing)
 - [API documentation](#api-documentation)
+- [Focused documentation](#focused-documentation)
 - [Installing and consuming wlonvif](#installing-and-consuming-wlonvif)
 - [Comparison to similar projects](#comparison-to-similar-projects)
   - [Compared with gSOAP and generated ONVIF clients](#compared-with-gsoap-and-generated-onvif-clients)
@@ -59,6 +61,29 @@ transport.
 - Deterministic virtual transport for tests and development without camera hardware.
 - Static/shared builds, sanitizers, fuzzing support, Doxygen, install packages, and
   standalone consumer verification.
+
+## Supported scope
+
+`wlonvif` deliberately provides a curated application-facing API rather than a
+generated binding for every ONVIF schema. The current surface is:
+
+| Area | Supported operations and behavior |
+|---|---|
+| Device | Device information, system UTC time, scopes, services, and capabilities. |
+| Media1 | Profile enumeration, stream URI retrieval, snapshot URI retrieval, and bounded snapshot download. |
+| PTZ | Advertised spaces, normalized status, continuous/relative/absolute movement, Stop, emergency Stop, presets, and preset navigation. |
+| Stateful PTZ | Input ownership, latest-intent coalescing, shaping, ramps, pacing, watchdog and maximum-run safety, soft limits, keep-out zones, zoom-speed curves, telemetry, and bounded close. |
+| Viewport movement | Validated click-to-center and box-zoom mapping with crop, rotation, mirroring, directional gains, calibration age, and zoom interpolation. |
+| Events | Explicit PullPoint create/pull/renew/unsubscribe handles plus automatic bounded polling, renewal, reconnect, backoff, and continuity-health reporting. |
+| Discovery | IPv4 WS-Discovery multicast and targeted unicast, common-path direct probing, per-action host authorization, authorized CIDR expansion, evidence merging, duplicate suppression, progress, and concurrency/result bounds. |
+| Security | WS-Security UsernameToken digest, challenge-driven HTTP authentication, HTTPS verification, credential providers and leases, endpoint policy, DNS-candidate authorization, response/XML limits, and structured failures. |
+| Testing | Deterministic virtual Device/Media/PTZ/Event behavior without sockets or camera hardware. |
+
+Not currently provided are Media2, Imaging, Analytics, Recording, Replay, RTP/RTSP
+playback, codecs, a general ONVIF network server, push-event notification hosting,
+or formal ONVIF conformance certification. Service availability also depends on the
+camera profile and firmware; an advertised endpoint is not proof that every device
+implements it correctly.
 
 ## Requirements
 
@@ -198,6 +223,150 @@ Operations return cold `Task<Result<T>>` values: work begins when the task is
 started. Each network operation accepts `CallOptions`, allowing the caller to set a
 deadline and cancellation token. See the examples for complete synchronous command-
 line adapters around these asynchronous tasks.
+
+A minimal connection uses the structured options API:
+
+```cpp
+#include <chrono>
+#include <future>
+#include <iostream>
+#include <wlonvif/wlonvif.hpp>
+
+using namespace std::chrono_literals;
+
+int main()
+{
+    auto created = wlonvif::Runtime::create();
+    if (!created) return 1;
+    auto runtime = created.value();
+
+    wlonvif::DeviceSessionOptions connection;
+    connection.device_url = "https://camera/onvif/device_service";
+    connection.runtime = runtime;
+    connection.endpoint_policy = wlonvif::make_same_host_policy();
+    connection.transport = wlonvif::make_curl_transport(runtime);
+    connection.credential_provider = wlonvif::make_fixed_credential_provider(
+        {"operator", "password", false});
+    connection.call = {
+        std::chrono::steady_clock::now() + 10s,
+        wlonvif::CancellationSource{}.token()
+    };
+
+    auto finished = std::make_shared<std::promise<void>>();
+    auto finished_future = finished->get_future();
+    auto task = wlonvif::DeviceSession::connect(std::move(connection));
+    std::move(task).start([runtime, finished](auto connected) {
+        if (!connected) {
+            std::cerr << connected.error().message << '\n';
+            (void)runtime->shutdown();
+            finished->set_value();
+            return;
+        }
+        auto session = connected.value();
+        auto call = wlonvif::CallOptions{
+            std::chrono::steady_clock::now() + 5s,
+            wlonvif::CancellationSource{}.token()
+        };
+        std::move(session->get_device_information(call)).start(
+            [runtime, session, finished](auto information) {
+                if (information)
+                    std::cout << information.value().manufacturer << ' '
+                              << information.value().model << '\n';
+                std::move(session->close(5s)).start(
+                    [runtime, finished](auto) {
+                        (void)runtime->shutdown();
+                        finished->set_value();
+                    });
+            });
+    });
+    finished_future.get();
+    return 0;
+}
+```
+
+The callbacks above may run through the runtime or inline during shutdown when the
+runtime can no longer accept queued work. Do not assume a particular completion
+thread unless an application adapter explicitly supplies that guarantee.
+
+### Task and result model
+
+- `Task<T>` is move-only, cold, and single-consumer. Call `std::move(task).start()`
+  exactly once; starting an already-consumed task throws `std::logic_error`.
+- `Result<T>` contains either a value or an owned `Error`. Check it before calling
+  `value()` or `error()`.
+- `CallOptions::deadline` is an absolute `std::chrono::steady_clock` time point.
+  There is intentionally no implicit infinite network deadline.
+- `CancellationSource` owns cancellation state. Tokens are cheap copyable views;
+  session operations link the caller token with session shutdown.
+- Cancellation and deadlines bound caller-visible DNS, authorization, HTTP, SOAP,
+  and service work. A remote device can still have received a non-idempotent request
+  before cancellation was observed.
+
+### Session lifecycle
+
+`DeviceSession` is the authoritative owner of child-operation admission,
+cancellation, credential-provider closure, and PTZ safety accounting:
+
+```text
+open  ->  closing  ->  closed
+```
+
+Call `close(cleanup_budget)` and consume its task when deterministic cleanup matters.
+Close is idempotent: it rejects new operations, cancels active work, closes the
+credential provider outside internal locks, issues bounded safety Stops for tracked
+PTZ movement, and completes all waiters once native accounting reaches a terminal
+state. `CloseResult::cleanup_complete` and `safety_complete` distinguish a completed
+close from expiry of the caller's cleanup budget. Internal accounting may continue
+after a budgeted result reports incomplete cleanup. Destruction remains a
+non-blocking cancellation and secret-release backstop.
+
+The shared `Runtime` owns completion dispatch. It is safe to call `shutdown()` more
+than once, concurrently, or from a completion running on its worker. Shutdown stops
+admission, runs registered bounded cleanup, drains accepted work, and joins or
+safely releases the worker as appropriate.
+
+### Transport and endpoint authorization
+
+Two independent policies protect network requests:
+
+1. `EndpointPolicy` checks whether an advertised Device, Media, PTZ, Event, or
+   download URL is acceptable relative to the original Device URL. The default
+   same-host policy permits a different port on the same host; same-origin policy
+   is stricter. Both reject URL user-info and unrelated hosts.
+2. An optional `CandidateAuthorizer` in `CurlTransportOptions` receives the
+   normalized host and port, complete DNS result set, proposed pinned address,
+   operation purpose/provenance, and an opaque resolution-attempt ID. Authorization
+   happens after one bounded resolution and before connection. The approved address
+   is pinned with libcurl so the request cannot silently re-resolve elsewhere.
+
+Active discovery has a separate `DiscoveryAuthorizer`. It receives the proposed
+interface enumeration, UDP bind/send, CIDR expansion, or TCP-connect action before
+that action occurs. Set `require_authorization` to fail closed when no authorizer is
+installed; denial is reported as `host_permission_denied` before socket creation.
+Authorization is optional by default for ordinary native applications. Restricted
+embeddings should install an authorizer and enable the fail-closed option explicitly:
+
+```cpp
+wlonvif::NetworkDiscoveryOptions discovery;
+discovery.authorizer = application_discovery_authorizer;
+discovery.require_authorization = true;
+```
+
+Redirect following is disabled. HTTPS certificate and hostname verification remain
+enabled. HTTP authentication begins only after a server challenge; Basic credentials
+are not sent over cleartext HTTP unless the credential explicitly opts in.
+
+### Errors and uncertain outcomes
+
+Use `Error::category` and `Error::operation` for control flow, not diagnostic text.
+Optional typed details retain HTTP status, bounded SOAP Fault fields, host-permission
+denial context, and PTZ safety-action results. `retryable` is a policy hint, not an
+instruction to retry blindly.
+
+Movement calls return `MoveResult::request_may_have_been_applied`; failures also use
+the error's uncertain-delivery signal. When delivery may have occurred, the PTZ
+safety ledger retains the profile as moving and attempts a bounded Stop. Movement
+requests are non-idempotent and are never automatically retried.
 
 The libraries exported to CMake consumers are:
 
@@ -520,7 +689,8 @@ bounded device command rate, ownership sequences, telemetry, and explicit close.
 `ViewportMapper` separately provides bounded click-to-center and box-zoom geometry,
 including crop/rotation/mirroring and direction-specific gains interpolated across
 manually calibrated zoom samples.
-See `docs/ptz-phase1.md` for its architecture and qualification workflow.
+See [Native PTZ control](docs/ptz-control.md) for controller architecture and the
+hardware qualification workflow.
 The `qualify` command performs one explicitly confirmed move limited to `0.25`,
 always requests emergency Stop, and reports request latencies and before/after status;
 it never performs an unattended sweep.
@@ -578,7 +748,31 @@ remote use should be placed behind an authenticating proxy. See
 Omit `--count` to continue until Ctrl-C. `--topic TEXT` filters topic names. Event
 JSON is emitted as one object per line when `--json` is enabled, while progress and
 diagnostics remain on stderr. The managed stream has a bounded queue and reports
-health/reconnection signals separately from device events.
+health/reconnection signals separately from device events. Its worker renews before
+expiry and recreates failed subscriptions with bounded exponential backoff. Use
+`EventClient::create_pullpoint()` when an application needs direct control over the
+individual create, pull, renew, and unsubscribe operations instead.
+
+The automatic API is cold at creation: start or await the returned task before using
+the stream, and close the stream before shutting down its runtime:
+
+```cpp
+auto events = session->event_client();
+if (!events) {
+    // Handle a closed session or unavailable Event backend.
+}
+
+wlonvif::ManagedEventOptions options;
+options.queue_capacity = 256;
+auto opening = events.value()->open_managed_stream(options, call_options);
+// Start/await `opening`, then repeatedly start/await stream->next(call_options).
+// Each item is either Event or StreamHealth; finally start/await stream->close(...).
+```
+
+For explicit lifecycle control, start or await `create_pullpoint()`, then call
+`pull(server_timeout, maximum_messages, ...)`, renew before the advertised
+`termination_time`, and consume `unsubscribe()` or bounded `close()` on every exit
+path. Operations on one handle are serialized and reject use after closure.
 
 ### Check camera health
 
@@ -646,6 +840,18 @@ build. The generated pages and graphs use the project's dark theme.
 
 Set `WLONVIF_INSTALL_DOCS=ON` to install the generated HTML under the platform CMake
 documentation directory.
+
+## Focused documentation
+
+- [Session and transport security contracts](docs/session-security.md) describes
+  lifecycle transitions, credential leases, candidate authorization, structured
+  failures, and the PTZ movement ledger.
+- [Native PTZ control](docs/ptz-control.md) covers SDL input mapping, calibration,
+  safety behavior, and real-device qualification.
+- [Browser PTZ control](docs/ptz-web.md) covers the Beast server, WebSocket protocol,
+  FFmpeg bridge, viewport calibration, remote threat model, and orderly shutdown.
+- The generated Doxygen main page is the API-oriented starting point; this README is
+  the build, example, deployment, and project-overview guide.
 
 ## Installing and consuming wlonvif
 
