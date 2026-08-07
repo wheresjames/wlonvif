@@ -1,0 +1,1 @@
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope"><SOAP-ENV:Body><ns2:GetDeviceInformationResponse><ns2:Manufacturer>ACME</ns2:Manufacturer></ns2:GetDeviceInformationResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>

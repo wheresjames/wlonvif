@@ -74,9 +74,11 @@ Building the core libraries requires:
 Doxygen and Graphviz `dot` are additionally required when
 `WLONVIF_BUILD_DOCS=ON`. LibFuzzer targets require Clang.
 
-VLC, mpv, and FFmpeg are not library dependencies. The media example only prints
-commands for these external programs; snapshot download is implemented by the
-library and needs no image codec.
+VLC, mpv, and FFmpeg are not library dependencies. The media example prints
+commands for external players, while the optional browser PTZ example can launch an
+installed FFmpeg at runtime for its simple MJPEG bridge. Snapshot download is
+implemented by the library and needs no image codec. SDL3 is required only by the
+native PTZ example; Boost 1.89 with JSON is required only by the browser example.
 
 ## Quick start
 
@@ -127,13 +129,18 @@ Important CMake options are:
 
 | Option | Default | Purpose |
 |---|---:|---|
-| `WLONVIF_BUILD_EVERYTHING` | `OFF` | Enable tests, examples, documentation, documentation installation, and Clang fuzzers where supported. |
+| `WLONVIF_BUILD_EVERYTHING` | `OFF` | Enable tests, examples including native SDL3 and browser PTZ control, documentation, documentation installation, and Clang fuzzers where supported. An installed SDL3 is preferred; otherwise its pinned source is fetched. |
 | `WLONVIF_BUILD_TESTING` | top-level `ON` | Build the deterministic test suite. |
-| `WLONVIF_BUILD_EXAMPLES` | `OFF` | Build all command-line examples. |
+| `WLONVIF_BUILD_EXAMPLES` | `OFF` | Build the dependency-light command-line examples. |
+| `WLONVIF_BUILD_PTZ_CONTROL` | `OFF` | Build the optional SDL3 native keyboard/gamepad PTZ example. |
+| `WLONVIF_BUILD_PTZ_WEB` | `OFF` | Build the optional Boost.Beast browser PTZ example. |
+| `WLONVIF_BUILD_PTZ_DEPENDENCY_SPIKES` | `OFF` | Build the SDL3 and Beast acceptance probes. |
+| `WLONVIF_FETCH_PTZ_DEPENDENCIES` | `OFF` | Fetch the pinned SDL3 release instead of requiring a system package. |
 | `WLONVIF_BUILD_DOCS` | `OFF` | Generate the Doxygen HTML reference. |
 | `WLONVIF_INSTALL_DOCS` | `OFF` | Install generated HTML documentation. |
-| `WLONVIF_BUILD_FUZZERS` | `OFF` | Build the XML libFuzzer target; requires Clang. |
+| `WLONVIF_BUILD_FUZZERS` | `OFF` | Build the XML and optional web-protocol libFuzzer targets; requires Clang. |
 | `WLONVIF_ENABLE_SANITIZERS` | `OFF` | Enable AddressSanitizer and UndefinedBehaviorSanitizer with GCC or Clang. |
+| `WLONVIF_ENABLE_THREAD_SANITIZER` | `OFF` | Enable ThreadSanitizer with GCC or Clang; cannot be combined with `WLONVIF_ENABLE_SANITIZERS`. |
 | `WLONVIF_ENABLE_HARDENING` | `ON` | Enable supported compiler and linker hardening. |
 | `WLONVIF_WARNINGS_AS_ERRORS` | `OFF` | Treat project compiler warnings as errors. |
 
@@ -149,8 +156,8 @@ Run the tests configured in an existing build tree:
 ctest --test-dir build --output-on-failure
 ```
 
-For release qualification, run the complete static, shared, sanitizer, install, and
-consumer matrix:
+For release qualification, run the complete static, shared, sanitizer, thread
+sanitizer, install, consumer, and fuzz-smoke matrix:
 
 ```sh
 ./scripts/test-all.sh
@@ -163,6 +170,17 @@ ptraced environments. Enable it in an unrestricted runner with:
 ```sh
 ASAN_OPTIONS=detect_leaks=1 ./scripts/test-all.sh
 ```
+
+The script ends with a short libFuzzer run over both targets when `clang++` is
+available. It is a regression gate rather than a fuzzing campaign; lengthen it with:
+
+```sh
+WLONVIF_FUZZ_SECONDS=300 ./scripts/test-all.sh
+```
+
+The same matrix runs in CI on every push and pull request, including a dedicated
+ThreadSanitizer job. Races on the completion paths are reported by no other
+sanitizer, so that job is not redundant with the address/UB one.
 
 ## Using the library
 
@@ -261,9 +279,12 @@ Most real-device examples support:
 
 ## Examples
 
-All examples are enabled by `WLONVIF_BUILD_EXAMPLES=ON` and are placed under
-`build/examples/<name>/`. They are intentionally small applications that demonstrate
-library behavior rather than production camera-management tools.
+The dependency-light examples are enabled by `WLONVIF_BUILD_EXAMPLES=ON` and are
+placed under `build/examples/<name>/`. Native and browser PTZ frontends additionally
+require `WLONVIF_BUILD_PTZ_CONTROL=ON` and `WLONVIF_BUILD_PTZ_WEB=ON`, respectively;
+`WLONVIF_BUILD_EVERYTHING=ON` enables both. Examples are intentionally focused
+applications that demonstrate library behavior rather than production
+camera-management tools.
 
 ### Discover devices
 
@@ -276,6 +297,27 @@ on each eligible IPv4 interface:
 ```sh
 ./build/examples/discover/wlonvif-discover --timeout 8
 ```
+
+When camera addresses are unknown, use the high-coverage local discovery preset.
+It combines multicast on every eligible interface with direct inspection and
+Device-service verification across eligible directly connected networks:
+
+```sh
+./build/examples/discover/wlonvif-discover --discover-all
+```
+
+`--discover-all` defaults to a 60-second overall deadline and 32 simultaneous
+direct probes. It prints the directly scanned CIDRs before starting. Networks
+larger than the `--max-hosts` safety bound (1024 by default) are not scanned;
+specify a larger authorized bound or an explicit CIDR when appropriate:
+
+```sh
+./build/examples/discover/wlonvif-discover \
+  --discover-all --max-hosts 65536 --timeout 180 --jobs 64
+```
+
+No local discovery mode can inspect unknown routed VLANs or networks hidden by
+firewall policy. Add those authorized networks explicitly with `--scan CIDR`.
 
 Inspect a known address using unicast discovery and common Device service paths:
 
@@ -436,51 +478,92 @@ PTZ commands require a Media profile token. Start with read-only operations:
 ./build/examples/ptz/wlonvif-ptz \
   --ip CAMERA_IP --profile profile_1 presets \
   --username CAMERA_USER --allow-cleartext-basic
+
+./build/examples/ptz/wlonvif-ptz \
+  --ip CAMERA_IP --profile profile_1 spaces \
+  --username CAMERA_USER --allow-cleartext-basic
 ```
 
 Movement is opt-in: every movement command requires `--confirm-movement`, normalized
-axes are clamped to `[-0.25, +0.25]`, and independent safety Stop attempts are made
-on completion and expected error/exit paths.
+axes must be in `[-1, +1]`, and a timed continuous movement is followed by an
+independent emergency Stop request.
 
 Perform a small relative pan:
 
 ```sh
 ./build/examples/ptz/wlonvif-ptz \
-  --ip CAMERA_IP --profile profile_1 move --pan 0.05 \
+  --ip CAMERA_IP --profile profile_1 move --relative --pan 0.05 \
   --username CAMERA_USER --allow-cleartext-basic --confirm-movement
 ```
 
-Add `--continuous --duration-ms 750` for a time-bounded continuous movement. Use
-`--tilt` and `--zoom` for the other axes.
+Omit `--relative` for a time-bounded continuous movement and select its bound with
+`--duration-ms 750`. Use `--tilt` and `--zoom` for the other axes. `absolute` uses
+the device's advertised absolute position space when available.
 
-Move to a preset or visit a short preset tour:
+Move to an absolute position or preset:
 
 ```sh
+./build/examples/ptz/wlonvif-ptz \
+  --ip CAMERA_IP --profile profile_1 absolute --pan 0 --tilt 0 \
+  --username CAMERA_USER --allow-cleartext-basic --confirm-movement
+
 ./build/examples/ptz/wlonvif-ptz \
   --ip CAMERA_IP --profile profile_1 goto-preset --preset home \
   --username CAMERA_USER --allow-cleartext-basic --confirm-movement
-
-./build/examples/ptz/wlonvif-ptz \
-  --ip CAMERA_IP --profile profile_1 tour \
-  --preset entrance --preset driveway --duration-ms 2000 \
-  --username CAMERA_USER --allow-cleartext-basic --confirm-movement
 ```
 
-Interactive keyboard control works in a real terminal:
+The diagnostic CLI intentionally has no interactive terminal mode: portable terminal
+input cannot report reliable key release. Applications should use `PtzController`,
+which provides latest-intent coalescing, acceleration/deceleration ramps, response
+curves and dead zones, zoom-aware pan/tilt speed, watchdog and maximum-run stops,
+bounded device command rate, ownership sequences, telemetry, and explicit close.
+`ViewportMapper` separately provides bounded click-to-center and box-zoom geometry,
+including crop/rotation/mirroring and direction-specific gains interpolated across
+manually calibrated zoom samples.
+See `docs/ptz-phase1.md` for its architecture and qualification workflow.
+The `qualify` command performs one explicitly confirmed move limited to `0.25`,
+always requests emergency Stop, and reports request latencies and before/after status;
+it never performs an unattended sweep.
+
+For native keyboard, mapped-gamepad, and raw-joystick control, configure with
+`WLONVIF_BUILD_PTZ_CONTROL=ON`. The optional `wlonvif-ptz-control` executable uses
+SDL3 for real press/release and hot-plug state while leaving movement policy in
+`PtzController`. It also provides camera-free input diagnostics and calibration.
+See [Native PTZ control](docs/ptz-control.md) for build, mapping, safety, and
+qualification guidance.
+
+For the loopback-first browser controller, configure with
+`WLONVIF_BUILD_PTZ_WEB=ON`. It provides keyboard, pointer/touch, external video,
+click-to-center/box movement, presets and cancellable tours over a bounded
+authenticated WebSocket protocol. It queries all Media profiles and their PTZ
+spaces, permits safe live profile selection, and dims controls unsupported by the
+active profile. Click direction can be reversed in the UI for nonconforming or
+mirrored cameras. Versioned calibration JSON supports independent left/right/up/down
+gains and optional interpolation across normalized zoom samples.
+Load that configuration with `--viewport-calibration FILE`.
+
+Build and run it with automatic profile selection and ONVIF stream discovery:
 
 ```sh
-./build/examples/ptz/wlonvif-ptz \
-  --ip CAMERA_IP --profile profile_1 keyboard --speed 0.10 \
-  --username CAMERA_USER --allow-cleartext-basic --confirm-movement
+cmake -S . -B build-web \
+  -DWLONVIF_BUILD_EXAMPLES=ON -DWLONVIF_BUILD_PTZ_WEB=ON
+cmake --build build-web --target wlonvif-ptz-web
+
+WLONVIF_PASSWORD='CAMERA_PASSWORD' \
+./build-web/examples/ptz-web/wlonvif-ptz-web \
+  --ip CAMERA_IP --username CAMERA_USER --confirm-movement --ffmpeg-stream
 ```
 
-Use WASD or cursor keys for pan/tilt, `+` and `-` for zoom, Space to Stop, and Q to
-exit. Direction changes send movement commands; keyboard repeats are coalesced and
-extend a short lease. Releasing the key infers one Stop. Tune terminal behavior with
-`--initial-hold-ms` (default 550) and `--release-ms` (default 180). If autorepeat is
-unreliable, `--latched` keeps moving until another direction, Space, or Q is pressed.
-The ASCII position marker refreshes after Stop so status calls cannot delay the
-safety loop while the camera is moving.
+`--profile TOKEN` optionally chooses the startup profile; otherwise the first
+advertised profile is used. `--ffmpeg-stream [URL]` discovers that profile's ONVIF
+stream URI or accepts an explicit relay/source override, then launches an installed
+FFmpeg to provide a video-only MJPEG bridge. FFmpeg is an optional POSIX runtime
+integration and the input URI may be visible to same-user process inspection.
+Changing the PTZ profile in the browser does not restart the startup FFmpeg stream.
+The server defaults to loopback HTTP/WS; remote binding requires TLS, an explicit
+Origin allowlist, and `--allow-remote`. The example has no user authentication, so
+remote use should be placed behind an authenticating proxy. See
+[Browser PTZ control](docs/ptz-web.md) for its security and calibration contract.
 
 ### Monitor events
 
@@ -693,8 +776,8 @@ target firmware.
 [OnvifClient_gSOAP](https://github.com/Allforgot/OnvifClient_gSOAP) is a concrete
 C++ ONVIF wrapper and sample project built on generated gSOAP code. Its published
 sample demonstrates Device information and capabilities together with Media and PTZ
-workflows, including AbsoluteMove and ContinuousMove. Absolute PTZ movement is a
-notable documented capability that `wlonvif` does not currently expose directly.
+workflows, including AbsoluteMove and ContinuousMove. Both libraries expose these
+operations; `wlonvif` also retains advertised operation-specific space URIs/ranges.
 
 Key differences:
 
@@ -707,9 +790,8 @@ Key differences:
 - OnvifClient_gSOAP documents remote discovery as unfinished. `wlonvif` treats
   discovery as a primary feature and combines multicast, targeted unicast, bounded
   CIDR probing, and duplicate suppression.
-- `wlonvif` has a smaller PTZ surface today: relative and continuous movement,
-  status, Stop, presets, and preset navigation. OnvifClient_gSOAP may be a better
-  reference when direct AbsoluteMove behavior is required.
+- `wlonvif` has a curated PTZ surface: absolute, relative, and continuous movement,
+  status, Stop, presets, preset navigation, and a stateful manual control policy.
 
 Choose OnvifClient_gSOAP when an existing gSOAP toolchain is welcome, its binding
 style matches the application, or its demonstrated AbsoluteMove workflow is closer

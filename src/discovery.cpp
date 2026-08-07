@@ -5,9 +5,11 @@
 #include <cerrno>
 #include <cstring>
 #include <curl/curl.h>
+#include "curl_init.hpp"
+#include "dispatch.hpp"
+#include "xml_scan.hpp"
 #include <map>
 #include <random>
-#include <regex>
 #include <set>
 #include <sstream>
 #include <wlonvif/wlonvif.hpp>
@@ -24,7 +26,7 @@ constexpr SocketHandle InvalidSocket = INVALID_SOCKET;
 #include <fcntl.h>
 #include <net/if.h>
 #include <netinet/in.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 using SocketHandle = int;
@@ -90,17 +92,48 @@ namespace wlonvif
 #endif
         }
 
+        // Discovery datagrams are unauthenticated attacker-reachable input, so they
+        // are scanned in a single forward pass rather than with std::regex, whose
+        // recursive backtracking overflows the stack on adversarial documents.
         std::string first_element(std::string_view xml, std::string_view name)
         {
-            const std::regex expression(
-                "<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?" + std::string(name) +
-                    "(?:\\s[^>]*)?>([^<]*)</(?:[A-Za-z_][A-Za-z0-9_.-]*:)?" + std::string(name) +
-                    ">",
-                std::regex::icase
+            return detail_xml::first_text(xml, name);
+        }
+
+        /// Return the lowercase host of @p url, or empty when it has none.
+        std::string url_host(std::string_view url)
+        {
+            const auto scheme = url.find("://");
+            if (scheme == url.npos)
+            {
+                return {};
+            }
+            auto authority = url.substr(scheme + 3);
+            authority = authority.substr(0, authority.find_first_of("/?#"));
+            const auto at = authority.rfind('@');
+            if (at != authority.npos)
+            {
+                authority.remove_prefix(at + 1);
+            }
+            std::string host;
+            if (!authority.empty() && authority.front() == '[')
+            {
+                const auto closing = authority.find(']');
+                host = closing == authority.npos
+                           ? std::string{}
+                           : std::string(authority.substr(1, closing - 1));
+            }
+            else
+            {
+                host = std::string(authority.substr(0, authority.find(':')));
+            }
+            std::transform(
+                host.begin(),
+                host.end(),
+                host.begin(),
+                [](unsigned char value) { return static_cast<char>(std::tolower(value)); }
             );
-            std::cmatch match;
-            return std::regex_search(xml.begin(), xml.end(), match, expression) ? match[1].str()
-                                                                                : std::string{};
+            return host;
         }
 
         std::vector<std::string> words(const std::string& input)
@@ -254,7 +287,7 @@ namespace wlonvif
 
         void receive_matches(
             SocketHandle socket,
-            std::string interface,
+            std::string interface_address,
             std::chrono::steady_clock::time_point end,
             const CancellationToken& cancellation,
             std::map<std::string, DeviceCandidate>& candidates,
@@ -264,20 +297,21 @@ namespace wlonvif
             std::array<char, MaximumDatagram> buffer{};
             while (!cancellation.stop_requested() && std::chrono::steady_clock::now() < end)
             {
-                auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                     end - std::chrono::steady_clock::now()
                 );
-                timeval timeout{
-                    static_cast<long>(remaining.count() / 1'000'000),
-                    static_cast<long>(remaining.count() % 1'000'000)
-                };
-                fd_set readable;
-                FD_ZERO(&readable);
-                FD_SET(socket, &readable);
+                if (remaining.count() <= 0)
+                {
+                    break;
+                }
+                // poll() rather than select(): fd_set silently overflows for any
+                // descriptor at or above FD_SETSIZE, which a busy process reaches.
+                pollfd readable{socket, POLLIN, 0};
+                const int selected =
 #ifdef _WIN32
-                const int selected = select(0, &readable, nullptr, nullptr, &timeout);
+                    WSAPoll(&readable, 1, static_cast<int>(remaining.count()));
 #else
-                const int selected = select(socket + 1, &readable, nullptr, nullptr, &timeout);
+                    poll(&readable, 1, static_cast<int>(remaining.count()));
 #endif
                 if (selected <= 0)
                 {
@@ -311,7 +345,7 @@ namespace wlonvif
                 observation.kind = DiscoveryKind::probe_match;
                 observation.endpoint_reference = first_element(xml, "Address");
                 observation.source = address_text.data();
-                observation.interface_id = interface;
+                observation.interface_id = interface_address;
                 observation.scopes = words(first_element(xml, "Scopes"));
                 observation.xaddrs = words(first_element(xml, "XAddrs"));
                 if (observation.endpoint_reference.empty() && observation.xaddrs.empty())
@@ -323,9 +357,18 @@ namespace wlonvif
                 candidate.evidence = DeviceEvidence::discovery;
                 candidate.discovery = observation;
                 candidate.diagnostic = "WS-Discovery ProbeMatch";
-                if (!observation.xaddrs.empty())
+                // The observation keeps every advertised XAddr verbatim because it
+                // is documented as untrusted. device_service is different: callers
+                // connect to it, so only an address the responding host actually
+                // claims for itself may be promoted. Otherwise a spoofed ProbeMatch
+                // redirects the caller to any host it names.
+                for (const auto& advertised : observation.xaddrs)
                 {
-                    candidate.device_service = observation.xaddrs.front();
+                    if (url_host(advertised) == candidate.address)
+                    {
+                        candidate.device_service = advertised;
+                        break;
+                    }
                 }
                 merge_candidate(candidates, std::move(candidate), maximum_results);
             }
@@ -348,7 +391,7 @@ namespace wlonvif
             for (std::size_t interface_index = 0; interface_index < interfaces.size();
                  ++interface_index)
             {
-                const auto& interface = interfaces[interface_index];
+                const auto& interface_address = interfaces[interface_index];
                 if (cancellation.stop_requested() || std::chrono::steady_clock::now() >= deadline)
                 {
                     return;
@@ -358,7 +401,7 @@ namespace wlonvif
                     DiscoveryProgressStage::ws_discovery,
                     interface_index,
                     interfaces.size(),
-                    interface
+                    interface_address
                 );
                 SocketHandle socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                 if (socket == InvalidSocket)
@@ -368,7 +411,7 @@ namespace wlonvif
                 sockaddr_in local{};
                 local.sin_family = AF_INET;
                 local.sin_port = htons(0);
-                if (inet_pton(AF_INET, interface.c_str(), &local.sin_addr) != 1 ||
+                if (inet_pton(AF_INET, interface_address.c_str(), &local.sin_addr) != 1 ||
                     bind(socket, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0)
                 {
                     close_socket(socket);
@@ -439,7 +482,7 @@ namespace wlonvif
                 const auto listen_end =
                     std::min(deadline, std::chrono::steady_clock::now() + options.listen_duration);
                 receive_matches(
-                    socket, interface, listen_end, cancellation, candidates, options.maximum_results
+                    socket, interface_address, listen_end, cancellation, candidates, options.maximum_results
                 );
                 close_socket(socket);
                 report_progress(
@@ -447,7 +490,7 @@ namespace wlonvif
                     DiscoveryProgressStage::ws_discovery,
                     interface_index + 1,
                     interfaces.size(),
-                    interface
+                    interface_address
                 );
             }
         }
@@ -615,14 +658,6 @@ namespace wlonvif
             return addresses;
         }
 
-        std::string origin(const std::string& url)
-        {
-            const auto scheme = url.find("://");
-            const auto path =
-                scheme == std::string::npos ? std::string::npos : url.find('/', scheme + 3);
-            return url.substr(0, path);
-        }
-
         std::size_t collect_body(char* data, std::size_t size, std::size_t count, void* user)
         {
             auto& body = *static_cast<std::string*>(user);
@@ -645,10 +680,15 @@ namespace wlonvif
         )
         {
             const auto body = soap_envelope(OperationId::get_system_date_and_time, "");
-            std::vector<std::string> urls;
+            struct Candidate
+            {
+                std::string url;
+                bool untrusted; ///< True when the device, not the caller, supplied it.
+            };
+            std::vector<Candidate> urls;
             if (advertised_url)
             {
-                urls.push_back(*advertised_url);
+                urls.push_back({*advertised_url, true});
             }
             for (auto port : options.ports)
             {
@@ -656,18 +696,26 @@ namespace wlonvif
                 {
                     const bool secure = port == 443 || port == 8443;
                     urls.push_back(
-                        (secure ? "https://" : "http://") + address + ":" +
-                        std::to_string(port) + path
+                        {(secure ? "https://" : "http://") + address + ":" +
+                             std::to_string(port) + path,
+                         false}
                     );
                 }
             }
-            for (const auto& url : urls)
+            // The address under inspection is the origin the policy is evaluated
+            // against. Authorizing a URL against its own origin, as this previously
+            // did, makes every policy a tautology: a spoofed ProbeMatch can then
+            // name any host or port and have this send a request to it.
+            const std::string reference_origin = "http://" + address;
+            for (const auto& [url, untrusted] : urls)
             {
                 if (cancellation.stop_requested() || std::chrono::steady_clock::now() >= deadline)
                 {
                     return std::nullopt;
                 }
-                if (!policy.authorize(url, origin(url)))
+                // URLs built from the caller's own address, ports, and paths carry
+                // no device input and are authorized by construction.
+                if (untrusted && !policy.authorize(url, reference_origin))
                 {
                     continue;
                 }
@@ -909,7 +957,8 @@ namespace wlonvif
                                 if (!expanded)
                                 {
                                     result = expanded.error();
-                                    runtime->post(
+                                    detail::dispatch(
+                                        runtime,
                                         [completion = std::move(completion),
                                          result = std::move(result)]() mutable
                                         {
@@ -974,7 +1023,7 @@ namespace wlonvif
                             );
                             if (options.direct_probe && endpoint_policy)
                             {
-                                (void)curl_global_init(CURL_GLOBAL_DEFAULT);
+                                detail::initialize_curl();
                                 direct_probe(
                                     addresses,
                                     options,
@@ -1011,7 +1060,8 @@ namespace wlonvif
                                 error.what()
                             };
                         }
-                        runtime->post(
+                        detail::dispatch(
+                            runtime,
                             [completion = std::move(completion),
                              result = std::move(result)]() mutable
                             {

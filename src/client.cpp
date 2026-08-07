@@ -1,7 +1,9 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
+#include "dispatch.hpp"
 #include "network_services.hpp"
+#include "xml_scan.hpp"
 #include <wlonvif/wlonvif.hpp>
 
 namespace wlonvif
@@ -16,7 +18,14 @@ namespace wlonvif
                 return {};
             }
             auto e = u.find('/', p + 3);
-            return std::string(u.substr(0, e));
+            std::string result(u.substr(0, e));
+            std::transform(
+                result.begin(),
+                result.end(),
+                result.begin(),
+                [](unsigned char value) { return static_cast<char>(std::tolower(value)); }
+            );
+            return result;
         }
         struct UrlParts
         {
@@ -71,15 +80,18 @@ namespace wlonvif
         {
             Result<void> authorize(std::string_view u, std::string_view o) const override
             {
-                if (origin(u) != o)
+                if (u.find('@') != u.npos)
+                {
+                    return Error{ErrorCategory::endpoint_rejected, {}, "URL user-info rejected"};
+                }
+                const auto candidate = origin(u);
+                // A URL with no scheme has an empty origin, which would otherwise
+                // compare equal to another empty origin and authorize itself.
+                if (candidate.empty() || candidate != origin(o))
                 {
                     return Error{
                         ErrorCategory::endpoint_rejected, {}, "cross-origin endpoint rejected"
                     };
-                }
-                if (u.find('@') != u.npos)
-                {
-                    return Error{ErrorCategory::endpoint_rejected, {}, "URL user-info rejected"};
                 }
                 return {};
             }
@@ -103,22 +115,15 @@ namespace wlonvif
                 return {};
             }
         };
+        /**
+         * @brief Return the text of the first element with local name @p n.
+         *
+         * Devices vary the namespace prefix they emit for the same element
+         * (`tds:`, `ns2:`, or none at all), so the prefix is ignored entirely.
+         */
         std::string field(std::string_view x, std::string_view n, std::size_t from = 0)
         {
-            auto a = x.find("<tds:" + std::string(n) + ">", from);
-            std::size_t skip = 6 + n.size();
-            if (a == x.npos)
-            {
-                a = x.find("<tt:" + std::string(n) + ">", from);
-                skip = 5 + n.size();
-            }
-            if (a == x.npos)
-            {
-                return {};
-            }
-            a += skip;
-            auto b = x.find("</", a);
-            return std::string(x.substr(a, b - a));
+            return detail_xml::first_text(x, n, from);
         }
         template <class T, class Decode>
         Task<Result<T>> decoded(Task<Result<std::string>> source, Decode decode)
@@ -264,7 +269,7 @@ namespace wlonvif
              c = std::move(c),
              options](auto done) mutable
             {
-                r->post(
+                auto work =
                     [u = std::move(u),
                      t = std::move(t),
                      p = std::move(p),
@@ -272,46 +277,59 @@ namespace wlonvif
                      c = std::move(c),
                      options,
                      done = std::move(done)]() mutable
+                {
+                    if (options.cancellation.stop_requested())
                     {
-                        if (options.cancellation.stop_requested())
-                        {
-                            done(Error{ErrorCategory::cancelled});
-                            return;
-                        }
-                        auto a = p->authorize(u, origin(u));
-                        if (!a)
-                        {
-                            done(a.error());
-                            return;
-                        }
-                        done(
-                            std::shared_ptr<DeviceSession>(new DeviceSession(
-                                std::move(u),
-                                std::move(t),
-                                std::move(p),
-                                std::move(r),
-                                std::move(c)
-                            ))
-                        );
+                        done(Error{ErrorCategory::cancelled});
+                        return;
                     }
-                );
+                    auto a = p->authorize(u, origin(u));
+                    if (!a)
+                    {
+                        done(a.error());
+                        return;
+                    }
+                    done(
+                        std::shared_ptr<DeviceSession>(new DeviceSession(
+                            std::move(u), std::move(t), std::move(p), std::move(r), std::move(c)
+                        ))
+                    );
+                };
+                auto runtime = r;
+                detail::dispatch(runtime, std::move(work));
             }
         );
     }
     Task<Result<std::string>>
     DeviceSession::invoke(OperationId op, std::string_view response, CallOptions options)
     {
-        HttpRequest q{
-            url_,
-            soap_envelope(op, "", credentials_),
-            {"Content-Type: application/soap+xml; charset=utf-8"},
-            options.deadline,
-            credentials_
-        };
-        auto source = transport_->send(std::move(q), options.cancellation);
         return Task<Result<std::string>>(
-            [source = std::move(source), response = std::string(response), op](auto done) mutable
+            [self = shared_from_this(),
+             op,
+             response = std::string(response),
+             options](auto done) mutable
             {
+                std::string envelope;
+                try
+                {
+                    // Envelope construction can fail when the CSPRNG backing the
+                    // WS-Security nonce is unavailable, so it belongs inside the
+                    // operation where the failure has an Error to travel in.
+                    envelope = soap_envelope(op, "", self->credentials_);
+                }
+                catch (const std::exception& error)
+                {
+                    done(Error{ErrorCategory::internal, op, error.what()});
+                    return;
+                }
+                HttpRequest q{
+                    self->url_,
+                    std::move(envelope),
+                    {"Content-Type: application/soap+xml; charset=utf-8"},
+                    options.deadline,
+                    self->credentials_
+                };
+                auto source = self->transport_->send(std::move(q), options.cancellation);
                 std::move(source).start(
                     [response = std::move(response),
                      op,
@@ -337,7 +355,8 @@ namespace wlonvif
                         if (r.value().status < 200 || r.value().status >= 300)
                         {
                             auto fault = read_soap_operation(r.value().body, response);
-                            if (!fault && fault.error().category == ErrorCategory::soap_fault)
+                            if (!fault && (fault.error().category == ErrorCategory::soap_fault ||
+                                           fault.error().category == ErrorCategory::authentication))
                             {
                                 auto error = fault.error();
                                 error.operation = op;
@@ -362,7 +381,21 @@ namespace wlonvif
                             done(std::move(e));
                             return;
                         }
-                        done(std::move(r.value().body));
+                        // Hand the decoders only the response element's own content.
+                        // Searching the whole envelope would let a SOAP Header, or
+                        // anything following the response, shadow the real fields.
+                        const auto element =
+                            detail_xml::find_element(r.value().body, response);
+                        if (!element)
+                        {
+                            done(Error{
+                                ErrorCategory::protocol_violation,
+                                op,
+                                "Expected SOAP response element missing"
+                            });
+                            return;
+                        }
+                        done(std::string(detail_xml::inner(r.value().body, *element)));
                     }
                 );
             }
@@ -388,24 +421,47 @@ namespace wlonvif
     {
         return decoded<SystemDateAndTime>(
             invoke(OperationId::get_system_date_and_time, "GetSystemDateAndTimeResponse", o),
-            [](auto& x)
+            [](auto& x) -> Result<SystemDateAndTime>
             {
+                const auto invalid = [](std::string message)
+                {
+                    return Error{
+                        ErrorCategory::protocol_violation,
+                        OperationId::get_system_date_and_time,
+                        std::move(message)
+                    };
+                };
+                // The response also carries LocalDateTime with identically named
+                // children, so the UTC subtree has to be selected explicitly rather
+                // than taking whichever Year element happens to appear first.
+                const auto utc = detail_xml::find_element(x, "UTCDateTime");
+                if (!utc)
+                {
+                    return invalid("device did not report a UTC date and time");
+                }
+                const auto subtree = std::string(detail_xml::inner(x, *utc));
                 const auto integer = [&](std::string_view name)
                 {
-                    const auto value = field(x, name);
-                    return value.empty() ? 0 : std::atoi(value.c_str());
+                    const auto value = field(subtree, name);
+                    return value.empty() ? -1 : std::atoi(value.c_str());
                 };
-                const auto date = std::chrono::year(integer("Year")) /
-                                  std::chrono::month(static_cast<unsigned>(integer("Month"))) /
-                                  std::chrono::day(static_cast<unsigned>(integer("Day")));
-                if (!date.ok())
+                const auto year = integer("Year");
+                const auto month = integer("Month");
+                const auto day = integer("Day");
+                const auto hour = integer("Hour");
+                const auto minute = integer("Minute");
+                const auto second = integer("Second");
+                const auto date = std::chrono::year(year) /
+                                  std::chrono::month(static_cast<unsigned>(month)) /
+                                  std::chrono::day(static_cast<unsigned>(day));
+                if (!date.ok() || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+                    second < 0 || second > 60)
                 {
-                    return SystemDateAndTime{};
+                    return invalid("device reported an invalid UTC date and time");
                 }
                 return SystemDateAndTime{
-                    std::chrono::sys_days(date) + std::chrono::hours(integer("Hour")) +
-                    std::chrono::minutes(integer("Minute")) +
-                    std::chrono::seconds(integer("Second"))
+                    std::chrono::sys_days(date) + std::chrono::hours(hour) +
+                    std::chrono::minutes(minute) + std::chrono::seconds(second)
                 };
             }
         );
@@ -417,14 +473,14 @@ namespace wlonvif
             [](auto& x)
             {
                 std::vector<std::string> v;
-                std::size_t p = 0;
-                while ((p = x.find("<tt:ScopeItem>", p)) != x.npos)
-                {
-                    p += 14;
-                    auto e = x.find("</tt:ScopeItem>", p);
-                    v.emplace_back(x.substr(p, e - p));
-                    p = e;
-                }
+                detail_xml::for_each_element(
+                    x,
+                    "ScopeItem",
+                    [&](const detail_xml::Element& item)
+                    {
+                        v.push_back(detail_xml::text(x, item));
+                    }
+                );
                 return v;
             }
         );
@@ -436,14 +492,15 @@ namespace wlonvif
             [](auto& x)
             {
                 std::vector<Service> v;
-                std::size_t p = 0;
-                while ((p = x.find("<tds:Service>", p)) != x.npos)
-                {
-                    auto e = x.find("</tds:Service>", p);
-                    auto part = std::string_view(x).substr(p, e - p);
-                    v.push_back({field(part, "Namespace"), field(part, "XAddr")});
-                    p = e;
-                }
+                detail_xml::for_each_element(
+                    x,
+                    "Service",
+                    [&](const detail_xml::Element& service)
+                    {
+                        const auto part = std::string(detail_xml::inner(x, service));
+                        v.push_back({field(part, "Namespace"), field(part, "XAddr")});
+                    }
+                );
                 return v;
             }
         );
@@ -455,56 +512,65 @@ namespace wlonvif
             [](auto& x)
             {
                 Capabilities c;
-                auto m = field(x, "XAddr", x.find("<tt:Media"));
-                if (!m.empty())
+                // Each XAddr must be read from inside its own service element;
+                // scanning forward from a position picks up the next service's
+                // address whenever the preceding one omits it.
+                const auto endpoint = [&](std::string_view service)
+                    -> std::optional<std::string>
                 {
-                    c.media_xaddr = m;
-                }
-                auto p = field(x, "XAddr", x.find("<tt:PTZ"));
-                if (!p.empty())
-                {
-                    c.ptz_xaddr = p;
-                }
-                auto e = field(x, "XAddr", x.find("<tt:Events"));
-                if (!e.empty())
-                {
-                    c.events_xaddr = e;
-                }
+                    const auto element = detail_xml::find_element(x, service);
+                    if (!element)
+                    {
+                        return std::nullopt;
+                    }
+                    auto address =
+                        field(std::string(detail_xml::inner(x, *element)), "XAddr");
+                    if (address.empty())
+                    {
+                        return std::nullopt;
+                    }
+                    return address;
+                };
+                c.media_xaddr = endpoint("Media");
+                c.ptz_xaddr = endpoint("PTZ");
+                c.events_xaddr = endpoint("Events");
                 return c;
             }
         );
     }
-    Result<std::shared_ptr<MediaClient>> DeviceSession::media()
+    /**
+     * @brief Return the session's single service backend, creating it on demand.
+     *
+     * One backend per session is required, not merely an optimization: it owns the
+     * PullPoint subscription and the cached capabilities, so handing out a fresh
+     * one per call would open a new subscription on every events() call and repeat
+     * GetCapabilities for every service client.
+     */
+    std::shared_ptr<ServiceBackend> DeviceSession::backend()
     {
-        auto b = std::dynamic_pointer_cast<ServiceBackend>(transport_);
-        if (!b)
+        std::lock_guard lock(backend_mutex_);
+        if (!backend_)
         {
-            b = make_network_service_backend(
+            backend_ = std::dynamic_pointer_cast<ServiceBackend>(transport_);
+        }
+        if (!backend_)
+        {
+            backend_ = make_network_service_backend(
                 url_, transport_, endpoint_policy_, runtime_, credentials_
             );
         }
-        return std::make_shared<MediaClient>(runtime_, std::move(b));
+        return backend_;
+    }
+    Result<std::shared_ptr<MediaClient>> DeviceSession::media()
+    {
+        return std::make_shared<MediaClient>(runtime_, backend());
     }
     Result<std::shared_ptr<PtzClient>> DeviceSession::ptz()
     {
-        auto b = std::dynamic_pointer_cast<ServiceBackend>(transport_);
-        if (!b)
-        {
-            b = make_network_service_backend(
-                url_, transport_, endpoint_policy_, runtime_, credentials_
-            );
-        }
-        return std::make_shared<PtzClient>(runtime_, std::move(b));
+        return std::make_shared<PtzClient>(runtime_, backend());
     }
     Result<std::shared_ptr<ManagedEventStream>> DeviceSession::events(std::size_t maximum)
     {
-        auto b = std::dynamic_pointer_cast<ServiceBackend>(transport_);
-        if (!b)
-        {
-            b = make_network_service_backend(
-                url_, transport_, endpoint_policy_, runtime_, credentials_
-            );
-        }
-        return std::make_shared<ManagedEventStream>(runtime_, std::move(b), maximum);
+        return std::make_shared<ManagedEventStream>(runtime_, backend(), maximum);
     }
 } // namespace wlonvif

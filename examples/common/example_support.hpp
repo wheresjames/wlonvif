@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <future>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -40,14 +41,21 @@ namespace wlonvif::examples
         std::string evidence;
     };
 
+    /**
+     * @brief Run a cold task to completion on the calling thread.
+     *
+     * The promise is shared-owned rather than left on the stack: future::get()
+     * returns as soon as the value is set, so a stack promise can be destroyed
+     * while the completing thread is still inside set_value().
+     */
     template <class T> T wait_for_task(Task<T> task)
     {
-        std::promise<T> promise;
-        auto future = promise.get_future();
+        auto promise = std::make_shared<std::promise<T>>();
+        auto future = promise->get_future();
         std::move(task).start(
-            [&promise](T value)
+            [promise](T value)
             {
-                promise.set_value(std::move(value));
+                promise->set_value(std::move(value));
             }
         );
         return future.get();

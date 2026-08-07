@@ -432,6 +432,11 @@ namespace wlonvif
 
     /**
      * @brief Download bounded opaque bytes from an authorized endpoint.
+     *
+     * The transport's own response byte limit applies first and is the smaller
+     * bound in practice: make_curl_transport() defaults to XmlLimits::bytes, so a
+     * @p maximum_bytes above that value cannot be reached. Construct the transport
+     * with matching limits when larger downloads are required.
      */
     Task<Result<BinaryData>> download_binary(
         std::string url,
@@ -499,12 +504,39 @@ namespace wlonvif
         double maximum{1};  ///< Inclusive native maximum.
     };
 
+    /// ONVIF two-axis coordinate space and its device-native ranges.
+    struct PtzSpace2D
+    {
+        std::string uri; ///< Space URI sent back with PTZ vectors when non-empty.
+        NativeRange x;  ///< Pan/translation X range.
+        NativeRange y;  ///< Tilt/translation Y range.
+    };
+
+    /// ONVIF one-axis coordinate space and its device-native range.
+    struct PtzSpace1D
+    {
+        std::string uri; ///< Space URI sent back with PTZ vectors when non-empty.
+        NativeRange x;  ///< Zoom range.
+    };
+
     /// Native ranges for the pan, tilt, and zoom axes.
     struct PtzSpaces
     {
+        PtzSpaces() = default;
+        /// Construct legacy convenience ranges; detailed spaces remain unknown.
+        PtzSpaces(NativeRange pan_value, NativeRange tilt_value, NativeRange zoom_value)
+            : pan(pan_value), tilt(tilt_value), zoom(zoom_value)
+        {
+        }
         NativeRange pan;  ///< Pan axis range.
         NativeRange tilt; ///< Tilt axis range.
         NativeRange zoom; ///< Zoom axis range.
+        std::vector<PtzSpace2D> absolute_pan_tilt; ///< Absolute position spaces.
+        std::vector<PtzSpace1D> absolute_zoom; ///< Absolute zoom spaces.
+        std::vector<PtzSpace2D> relative_pan_tilt; ///< Relative translation spaces.
+        std::vector<PtzSpace1D> relative_zoom; ///< Relative zoom spaces.
+        std::vector<PtzSpace2D> continuous_pan_tilt; ///< Continuous velocity spaces.
+        std::vector<PtzSpace1D> continuous_zoom; ///< Continuous zoom spaces.
     };
 
     /// Optional normalized PTZ components in the interval [-1, +1].
@@ -520,6 +552,9 @@ namespace wlonvif
     {
         PtzVector position; ///< Last reported normalized position.
         bool moving{false}; ///< True when any axis reports movement.
+        std::optional<bool> pan_tilt_moving; ///< Per-axis-group status when advertised.
+        std::optional<bool> zoom_moving; ///< Zoom status when advertised.
+        bool position_reliable{true}; ///< False when position could not be normalized.
     };
 
     /// Named PTZ preset.
@@ -535,6 +570,212 @@ namespace wlonvif
     {
         bool request_may_have_been_applied{false}; ///< Delivery outcome is uncertain.
         std::optional<Error> stop_error;           ///< Failure of a best-effort safety Stop.
+    };
+
+    /// Select whether velocity ramps are produced by the host or camera firmware.
+    enum class PtzRampMode
+    {
+        host,    ///< Emit intermediate velocity commands using ramp_up/ramp_down.
+        firmware ///< Emit target velocities directly and let the camera ramp.
+    };
+
+    /// Normalized rectangular pan/tilt region which manual motion may not enter.
+    struct PtzKeepOutZone
+    {
+        double minimum_pan{-1};  ///< Inclusive normalized left boundary.
+        double maximum_pan{1};   ///< Inclusive normalized right boundary.
+        double minimum_tilt{-1}; ///< Inclusive normalized lower boundary.
+        double maximum_tilt{1};  ///< Inclusive normalized upper boundary.
+    };
+
+    /// One point in a calibrated zoom-position to pan/tilt-speed scale curve.
+    struct PtzZoomSpeedPoint
+    {
+        double zoom{-1}; ///< Normalized zoom position in ascending order.
+        double scale{1}; ///< Pan/tilt multiplier at this zoom position.
+    };
+
+    /// Clockwise orientation of displayed video relative to camera coordinates.
+    enum class ViewportRotation { degrees_0, degrees_90, degrees_180, degrees_270 };
+
+    /// Geometry and camera-specific gains used for video-relative PTZ operations.
+    /// Direction-specific click-to-center gains measured at one zoom position.
+    struct ViewportCalibrationPoint
+    {
+        double zoom{};            ///< Normalized zoom position in [-1,+1].
+        double pan_left_gain{0.5};///< Relative translation at the left image edge.
+        double pan_right_gain{0.5};///< Relative translation at the right image edge.
+        double tilt_up_gain{0.5}; ///< Relative translation at the top image edge.
+        double tilt_down_gain{0.5};///< Relative translation at the bottom image edge.
+    };
+
+    /// Version-independent camera and displayed-video geometry used by ViewportMapper.
+    struct ViewportCalibration
+    {
+        double content_x{};      ///< Left edge of video content as viewport fraction.
+        double content_y{};      ///< Top edge of video content as viewport fraction.
+        double content_width{1}; ///< Video width as viewport fraction (excludes letterbox).
+        double content_height{1};///< Video height as viewport fraction (excludes letterbox).
+        ViewportRotation rotation{ViewportRotation::degrees_0}; ///< Display rotation.
+        bool mirror_horizontal{}; ///< Display is horizontally mirrored.
+        bool mirror_vertical{};   ///< Display is vertically mirrored.
+        double pan_gain{0.5};     ///< Relative pan translation at a horizontal edge.
+        double tilt_gain{0.5};    ///< Relative tilt translation at a vertical edge.
+        double box_zoom_gain{0.8};///< Zoom translation for a point-sized box.
+        double maximum_translation{0.5}; ///< Per-operation movement safety bound.
+        bool calibrated{};        ///< False selects conservative approximate behavior.
+        std::chrono::milliseconds maximum_age{std::chrono::hours(24)}; ///< Calibration freshness.
+        std::vector<ViewportCalibrationPoint> zoom_points; ///< Ordered direction-specific samples.
+    };
+
+    /// Pixel-space pointer or touch location and the viewport dimensions it belongs to.
+    struct ViewportPoint
+    {
+        double x{};
+        double y{};
+        double width{};
+        double height{};
+    };
+
+    /// Bounded relative movement produced from video geometry.
+    struct ViewportMove
+    {
+        PtzVector translation; ///< Relative normalized pan/tilt/zoom translation.
+        bool calibrated{};     ///< True only when camera-specific calibration was used.
+    };
+
+    /// Deterministic mapping for click-to-center and box-zoom operations.
+    class ViewportMapper
+    {
+      public:
+        explicit ViewportMapper(ViewportCalibration calibration = {});
+        Result<ViewportMove> click_to_center(
+            ViewportPoint point,
+            std::chrono::milliseconds calibration_age = std::chrono::milliseconds{0},
+            std::optional<double> normalized_zoom = std::nullopt
+        ) const;
+        Result<ViewportMove> box_zoom(
+            ViewportPoint first,
+            ViewportPoint second,
+            std::chrono::milliseconds calibration_age = std::chrono::milliseconds{0},
+            std::optional<double> normalized_zoom = std::nullopt
+        ) const;
+
+      private:
+        ViewportCalibration calibration_;
+    };
+
+    enum class PtzArrival { moving, settled, timed_out, degraded };
+
+    /// Deterministic arrival/settling detector for bounded automatic operations.
+    class PtzSettlingDetector
+    {
+      public:
+        PtzSettlingDetector(
+            std::chrono::milliseconds stable_duration = std::chrono::milliseconds{300},
+            std::chrono::milliseconds timeout = std::chrono::seconds{8},
+            double position_epsilon = 0.01
+        );
+        PtzArrival update(std::chrono::milliseconds elapsed, const PtzStatus& status);
+        void reset() noexcept;
+
+      private:
+        std::chrono::milliseconds stable_duration_;
+        std::chrono::milliseconds timeout_;
+        double epsilon_;
+        std::chrono::milliseconds total_{};
+        std::chrono::milliseconds stable_{};
+        std::optional<PtzVector> previous_;
+    };
+
+    /// Tunable, device-independent manual PTZ control policy.
+    struct PtzControllerConfig
+    {
+        std::chrono::milliseconds tick_interval{20}; ///< Internal control-law interval.
+        std::chrono::milliseconds command_interval{100}; ///< Minimum device update interval.
+        std::chrono::milliseconds command_refresh{500}; ///< Resend active velocity; zero disables.
+        std::chrono::milliseconds status_interval{1000}; ///< Status polling interval.
+        std::chrono::milliseconds ramp_up{300}; ///< Time from zero to full-scale velocity.
+        std::chrono::milliseconds ramp_down{200}; ///< Time from full-scale velocity to zero.
+        std::chrono::milliseconds input_watchdog{750}; ///< Stop after input lease expires.
+        std::chrono::milliseconds maximum_run{30000}; ///< Stop an uninterrupted manual run.
+        double dead_zone{0.08}; ///< Magnitudes at or below this value become zero.
+        double response_exponent{1.5}; ///< Exponential response after the dead zone.
+        double maximum_pan{0.6}; ///< Maximum normalized pan velocity.
+        double maximum_tilt{0.6}; ///< Maximum normalized tilt velocity.
+        double maximum_zoom{0.5}; ///< Maximum normalized zoom velocity.
+        double minimum_effective_speed{0.04}; ///< Smallest nonzero output magnitude.
+        double command_epsilon{0.01}; ///< Minimum change worth transmitting.
+        double zoomed_pan_tilt_scale{0.18}; ///< Pan/tilt scale at normalized zoom +1.
+        PtzRampMode ramp_mode{PtzRampMode::host}; ///< Host or camera-firmware ramping.
+        std::optional<NativeRange> pan_limits; ///< Optional normalized pan soft limits.
+        std::optional<NativeRange> tilt_limits; ///< Optional normalized tilt soft limits.
+        std::optional<NativeRange> zoom_limits; ///< Optional normalized zoom soft limits.
+        std::vector<PtzKeepOutZone> keep_out_zones; ///< Forbidden normalized regions.
+        std::vector<PtzZoomSpeedPoint> zoom_speed_curve; ///< Calibrated zoom scaling curve.
+        bool invert_pan{false}; ///< Reverse the pan input axis.
+        bool invert_tilt{false}; ///< Reverse the tilt input axis.
+        bool invert_zoom{false}; ///< Reverse the zoom input axis.
+    };
+
+    /// Observable state of a PtzController.
+    enum class PtzControllerMode
+    {
+        idle,    ///< No motion intent and the camera has been stopped.
+        manual,  ///< Manual input owns motion.
+        stopping,///< Velocity is ramping down or Stop is in flight.
+        degraded,///< A device operation failed; Stop remains available.
+        closed   ///< The controller accepts no further input.
+    };
+
+    /// Snapshot suitable for UI telemetry and diagnostics.
+    struct PtzControllerState
+    {
+        PtzControllerMode mode{PtzControllerMode::idle}; ///< Current state-machine mode.
+        PtzVector desired; ///< Shaped target velocity.
+        PtzVector commanded; ///< Latest velocity calculated by the control law.
+        std::optional<PtzStatus> reported; ///< Most recent device status.
+        std::optional<Error> last_error; ///< Most recent controller/device error.
+        std::uint64_t accepted_sequence{}; ///< Latest accepted owner input sequence.
+        std::size_t coalesced_inputs{}; ///< Inputs superseded before transmission.
+        std::size_t commands_sent{}; ///< ContinuousMove requests issued.
+        std::size_t stops_sent{}; ///< Stop requests issued.
+        std::chrono::microseconds last_input_to_command{}; ///< Latest accepted-input latency.
+        std::chrono::microseconds last_request_latency{}; ///< Latest device request duration.
+        std::size_t peak_pending_inputs{}; ///< Maximum latest-intent queue depth (at most one).
+    };
+
+    /**
+     * @brief Deterministic PTZ input shaping and acceleration model.
+     *
+     * advance() depends only on its arguments and retained model state, allowing
+     * exact tests with an injected duration instead of wall-clock sleeps.
+     */
+    class PtzControlLaw
+    {
+      public:
+        explicit PtzControlLaw(PtzControllerConfig config = {});
+        /// Set the newest raw normalized operator intent.
+        Result<void> set_input(PtzVector input);
+        /// Release all input axes and begin configured deceleration.
+        void release() noexcept;
+        /// Advance by @p elapsed using the latest normalized zoom position.
+        PtzVector advance(std::chrono::milliseconds elapsed, double normalized_zoom);
+        /// Advance using the complete reported position for limits and zoom scaling.
+        PtzVector advance(std::chrono::milliseconds elapsed, PtzVector reported_position);
+        /// Return the shaped target before ramping.
+        PtzVector desired() const;
+        /// Return the current ramped velocity.
+        PtzVector commanded() const;
+        /// Immediately clear target and commanded velocity.
+        void reset() noexcept;
+
+      private:
+        PtzControllerConfig config_;
+        PtzVector input_;
+        PtzVector desired_;
+        PtzVector commanded_;
+        bool configured_{true};
     };
 
     /**
@@ -714,6 +955,17 @@ namespace wlonvif
         /// Apply @p vector as a relative or continuous movement.
         virtual Result<MoveResult>
         move(const ProfileToken& profile, PtzVector vector, bool relative) = 0;
+        /// Apply an absolute position and optional normalized speed.
+        virtual Result<MoveResult> absolute_move(
+            const ProfileToken&, PtzVector, std::optional<PtzVector>
+        )
+        {
+            return Error{
+                ErrorCategory::unsupported,
+                OperationId::absolute_move,
+                "absolute PTZ movement is unsupported"
+            };
+        }
         /// Stop movement for @p profile.
         virtual Result<void> stop(const ProfileToken& profile) = 0;
         /// Return presets for @p profile.
@@ -765,6 +1017,13 @@ namespace wlonvif
         /// Apply a normalized relative translation.
         Task<Result<MoveResult>>
         relative_move(ProfileToken profile, PtzVector translation, CallOptions options);
+        /// Move to a normalized absolute position, optionally with normalized speed.
+        Task<Result<MoveResult>> absolute_move(
+            ProfileToken profile,
+            PtzVector position,
+            std::optional<PtzVector> speed,
+            CallOptions options
+        );
         /// Stop movement for @p profile.
         Task<Result<void>> stop(ProfileToken profile, CallOptions options);
         /// Bypass ordinary work ordering and request a safety Stop.
@@ -778,6 +1037,46 @@ namespace wlonvif
       private:
         std::shared_ptr<Runtime> runtime_;
         std::shared_ptr<ServiceBackend> backend_;
+    };
+
+    /**
+     * @brief Stateful manual PTZ driver with coalescing, ramps, leases, and safe Stop.
+     *
+     * Input methods are non-blocking. A private worker translates the newest intent
+     * into bounded-rate PtzClient calls. close() should be consumed before releasing
+     * the last reference when the final Stop result matters.
+     */
+    class PtzController final : public std::enable_shared_from_this<PtzController>
+    {
+      public:
+        /// Validate configuration and start a controller for one Media profile.
+        static Result<std::shared_ptr<PtzController>> create(
+            std::shared_ptr<PtzClient> client,
+            ProfileToken profile,
+            PtzControllerConfig config = {}
+        );
+        ~PtzController();
+        /// Claim manual control; an empty owner is invalid.
+        Result<void> claim_manual(std::string owner);
+        /// Submit a monotonically sequenced input for the current owner.
+        Result<void> set_manual_input(std::string_view owner, std::uint64_t sequence, PtzVector);
+        /// Convenience input for the built-in local owner.
+        Result<void> set_manual_input(PtzVector);
+        /// Release the current owner's input and ramp toward zero.
+        Result<void> release_manual(std::string_view owner);
+        /// Release ownership after input has been released.
+        Result<void> relinquish_manual(std::string_view owner);
+        /// Immediately clear intent and request an urgent device Stop.
+        Task<Result<void>> stop(CallOptions options);
+        /// Stop the worker and issue a final urgent Stop. Idempotent.
+        Task<Result<void>> close(CallOptions options);
+        /// Return a lock-consistent telemetry snapshot.
+        PtzControllerState state() const;
+
+      private:
+        struct Impl;
+        explicit PtzController(std::shared_ptr<Impl>);
+        std::shared_ptr<Impl> impl_;
     };
 
     /**
@@ -922,11 +1221,14 @@ namespace wlonvif
             std::optional<Credentials>
         );
         Task<Result<std::string>> invoke(OperationId, std::string_view response, CallOptions);
+        std::shared_ptr<ServiceBackend> backend();
         std::string url_;
         std::shared_ptr<HttpTransport> transport_;
         std::shared_ptr<EndpointPolicy> endpoint_policy_;
         std::shared_ptr<Runtime> runtime_;
         std::optional<Credentials> credentials_;
+        std::mutex backend_mutex_;
+        std::shared_ptr<ServiceBackend> backend_;
     };
 
     /**
@@ -973,6 +1275,8 @@ namespace wlonvif
         Result<PtzStatus> ptz_status(const ProfileToken&) override;
         /// Apply movement to virtual PTZ state.
         Result<MoveResult> move(const ProfileToken&, PtzVector, bool relative) override;
+        Result<MoveResult>
+        absolute_move(const ProfileToken&, PtzVector, std::optional<PtzVector>) override;
         /// Stop virtual PTZ movement.
         Result<void> stop(const ProfileToken&) override;
         /// Return configured PTZ presets.

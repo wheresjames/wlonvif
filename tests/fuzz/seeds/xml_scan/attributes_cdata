@@ -1,0 +1,1 @@
+<ns2:Profiles GuidToken="decoy" token="main"><ns2:Name><![CDATA[Main &amp; Only]]></ns2:Name><ns2:PanTilt x="-0.5" y="1e3"/><!-- comment --><ns2:Nested><ns2:Nested>deep</ns2:Nested></ns2:Nested></ns2:Profiles>

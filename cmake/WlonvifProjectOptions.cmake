@@ -1,0 +1,33 @@
+include_guard(GLOBAL)
+
+if(WLONVIF_ENABLE_SANITIZERS AND WLONVIF_ENABLE_THREAD_SANITIZER)
+  message(FATAL_ERROR
+    "ThreadSanitizer cannot be combined with AddressSanitizer; configure separate build trees")
+endif()
+
+# Apply project-owned diagnostics and hardening without modifying dependency targets.
+function(wlonvif_apply_project_options target)
+  target_compile_options(${target} PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
+  if(WLONVIF_WARNINGS_AS_ERRORS)
+    target_compile_options(${target} PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Werror>)
+  endif()
+  if(WLONVIF_ENABLE_SANITIZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      message(FATAL_ERROR "WLONVIF_ENABLE_SANITIZERS is supported with GCC and Clang")
+    endif()
+    target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+  endif()
+  if(WLONVIF_ENABLE_THREAD_SANITIZER)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      message(FATAL_ERROR "WLONVIF_ENABLE_THREAD_SANITIZER is supported with GCC and Clang")
+    endif()
+    target_compile_options(${target} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+    target_link_options(${target} PRIVATE -fsanitize=thread)
+  endif()
+  if(WLONVIF_ENABLE_HARDENING AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(${target} PRIVATE
+      -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2)
+    target_link_options(${target} PRIVATE -Wl,-z,relro,-z,now)
+  endif()
+endfunction()

@@ -1,8 +1,11 @@
 #include "network_services.hpp"
 
+#include "xml_scan.hpp"
+
+#include <algorithm>
 #include <condition_variable>
+#include <ctime>
 #include <map>
-#include <regex>
 #include <sstream>
 
 namespace wlonvif
@@ -24,126 +27,156 @@ namespace wlonvif
 
     namespace
     {
+        /**
+         * @brief Run a cold task to completion on the calling thread.
+         *
+         * The synchronization state is shared-owned rather than left on the stack.
+         * With stack state the waiter can wake, return, and destroy the condition
+         * variable while the completing thread is still inside notify_one(), which
+         * ThreadSanitizer flags on every call. Notifying under the lock closes the
+         * same window from the other side.
+         */
         template <class T> T wait_for_task(Task<T> task)
         {
-            std::mutex mutex;
-            std::condition_variable ready;
-            std::optional<T> result;
+            struct SharedState
+            {
+                std::mutex mutex;
+                std::condition_variable ready;
+                std::optional<T> result;
+            };
+            auto state = std::make_shared<SharedState>();
             std::move(task).start(
-                [&](T value)
+                [state](T value)
                 {
-                    {
-                        std::lock_guard lock(mutex);
-                        result.emplace(std::move(value));
-                    }
-                    ready.notify_one();
+                    std::lock_guard lock(state->mutex);
+                    state->result.emplace(std::move(value));
+                    state->ready.notify_one();
                 }
             );
-            std::unique_lock lock(mutex);
-            ready.wait(lock, [&] { return result.has_value(); });
-            return std::move(*result);
+            std::unique_lock lock(state->mutex);
+            state->ready.wait(lock, [&] { return state->result.has_value(); });
+            return std::move(*state->result);
         }
+
+        using detail_xml::attribute;
+        using detail_xml::numeric_attribute;
 
         std::string xml_escape(std::string_view input)
         {
-            std::string output;
-            for (char value : input)
-            {
-                switch (value)
-                {
-                    case '&': output += "&amp;"; break;
-                    case '<': output += "&lt;"; break;
-                    case '>': output += "&gt;"; break;
-                    case '"': output += "&quot;"; break;
-                    case '\'': output += "&apos;"; break;
-                    default: output += value;
-                }
-            }
-            return output;
+            return detail_xml::escape(input);
         }
 
-        std::string xml_unescape(std::string value)
-        {
-            const std::pair<std::string_view, std::string_view> entities[]{
-                {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""},
-                {"&apos;", "'"}
-            };
-            for (const auto& [encoded, decoded] : entities)
-            {
-                std::size_t position = 0;
-                while ((position = value.find(encoded, position)) != value.npos)
-                {
-                    value.replace(position, encoded.size(), decoded);
-                    position += decoded.size();
-                }
-            }
-            return value;
-        }
-
+        /// Return the character data of the first element with local name @p name.
         std::string first_element(std::string_view xml, std::string_view local_name)
         {
-            const std::regex expression(
-                "<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?" + std::string(local_name) +
-                    "(?:\\s[^>]*)?>([\\s\\S]*?)</(?:[A-Za-z_][A-Za-z0-9_.-]*:)?" +
-                    std::string(local_name) + ">",
-                std::regex::icase
-            );
-            std::match_results<std::string_view::const_iterator> match;
-            return std::regex_search(xml.begin(), xml.end(), match, expression)
-                       ? xml_unescape(std::string(match[1].first, match[1].second))
-                       : std::string{};
+            return detail_xml::first_text(xml, local_name);
         }
 
-        std::string attribute(std::string_view tag, std::string_view name)
+        /// Return the raw markup inside the first element with local name @p name.
+        std::string subtree(std::string_view xml, std::string_view local_name)
         {
-            const std::regex expression(
-                std::string(name) + "\\s*=\\s*['\"]([^'\"]*)['\"]", std::regex::icase
-            );
-            std::match_results<std::string_view::const_iterator> match;
-            return std::regex_search(tag.begin(), tag.end(), match, expression)
-                       ? xml_unescape(std::string(match[1].first, match[1].second))
-                       : std::string{};
-        }
-
-        std::optional<double> numeric_attribute(
-            std::string_view xml, std::string_view element, std::string_view name
-        )
-        {
-            const std::regex expression(
-                "<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?" + std::string(element) +
-                    "\\b[^>]*\\b" + std::string(name) + "\\s*=\\s*['\"]([^'\"]+)['\"]",
-                std::regex::icase
-            );
-            std::match_results<std::string_view::const_iterator> match;
-            if (!std::regex_search(xml.begin(), xml.end(), match, expression))
-            {
-                return std::nullopt;
-            }
-            try
-            {
-                return std::stod(std::string(match[1].first, match[1].second));
-            }
-            catch (...)
-            {
-                return std::nullopt;
-            }
+            const auto element = detail_xml::find_element(xml, local_name);
+            return element ? std::string(detail_xml::inner(xml, *element)) : std::string{};
         }
 
         std::optional<NativeRange> first_range(std::string_view xml, std::string_view name)
         {
-            const auto section = first_element(xml, name);
+            const auto section = subtree(xml, name);
             if (section.empty()) return std::nullopt;
-            const auto minimum = first_element(section, "Min");
-            const auto maximum = first_element(section, "Max");
-            try
+            const auto minimum = detail_xml::parse_double(first_element(section, "Min"));
+            const auto maximum = detail_xml::parse_double(first_element(section, "Max"));
+            if (!minimum || !maximum) return std::nullopt;
+            return NativeRange{*minimum, *maximum};
+        }
+
+        /**
+         * @brief Parse an ONVIF xs:dateTime such as `2024-05-06T07:08:09.5Z`.
+         *
+         * Returns nullopt for anything it cannot fully account for, so the caller
+         * can fall back rather than reporting a fabricated timestamp.
+         */
+        std::optional<std::chrono::system_clock::time_point>
+        parse_xsd_datetime(std::string_view text)
+        {
+            int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+            std::size_t index = 0;
+            const auto number = [&](int& output, std::size_t digits)
             {
-                if (!minimum.empty() && !maximum.empty())
-                    return NativeRange{std::stod(minimum), std::stod(maximum)};
-            }
-            catch (...)
+                if (index + digits > text.size()) return false;
+                const auto parsed = std::from_chars(
+                    text.data() + index, text.data() + index + digits, output
+                );
+                if (parsed.ec != std::errc{} || parsed.ptr != text.data() + index + digits)
+                {
+                    return false;
+                }
+                index += digits;
+                return true;
+            };
+            const auto literal = [&](char expected)
             {
+                if (index >= text.size() || text[index] != expected) return false;
+                ++index;
+                return true;
+            };
+            if (!number(year, 4) || !literal('-') || !number(month, 2) || !literal('-') ||
+                !number(day, 2) || !literal('T') || !number(hour, 2) || !literal(':') ||
+                !number(minute, 2) || !literal(':') || !number(second, 2))
+            {
+                return std::nullopt;
             }
-            return std::nullopt;
+            if (index < text.size() && text[index] == '.')
+            {
+                ++index;
+                while (index < text.size() && text[index] >= '0' && text[index] <= '9') ++index;
+            }
+            std::chrono::minutes offset{0};
+            if (index < text.size() && (text[index] == '+' || text[index] == '-'))
+            {
+                const int sign = text[index] == '-' ? -1 : 1;
+                ++index;
+                int offset_hours = 0, offset_minutes = 0;
+                if (!number(offset_hours, 2) || !literal(':') || !number(offset_minutes, 2))
+                {
+                    return std::nullopt;
+                }
+                offset = sign * (std::chrono::hours(offset_hours) +
+                                 std::chrono::minutes(offset_minutes));
+            }
+            else if (index < text.size() && (text[index] == 'Z' || text[index] == 'z'))
+            {
+                ++index;
+            }
+            if (index != text.size()) return std::nullopt;
+            const auto date = std::chrono::year(year) /
+                              std::chrono::month(static_cast<unsigned>(month)) /
+                              std::chrono::day(static_cast<unsigned>(day));
+            if (!date.ok() || hour > 23 || minute > 59 || second > 60) return std::nullopt;
+            return std::chrono::system_clock::time_point(
+                std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                    std::chrono::sys_days(date).time_since_epoch() + std::chrono::hours(hour) +
+                    std::chrono::minutes(minute) + std::chrono::seconds(second) - offset
+                )
+            );
+        }
+
+        /// Join every SimpleItem in @p xml as comma-separated `name=value` pairs.
+        std::string simple_items(std::string_view xml)
+        {
+            std::string output;
+            detail_xml::for_each_element(
+                xml,
+                "SimpleItem",
+                [&](const detail_xml::Element& item)
+                {
+                    const auto raw = detail_xml::attributes(xml, item);
+                    const auto name = attribute(raw, "Name");
+                    if (name.empty()) return;
+                    if (!output.empty()) output += ',';
+                    output += name + '=' + attribute(raw, "Value");
+                }
+            );
+            return output;
         }
 
         class NetworkServiceBackend final : public ServiceBackend
@@ -171,31 +204,26 @@ namespace wlonvif
                 );
                 if (!response) return response.error();
                 std::vector<MediaProfile> output;
-                const std::regex expression(
-                    "<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?Profiles\\b([^>]*)>([\\s\\S]*?)"
-                    "</(?:[A-Za-z_][A-Za-z0-9_.-]*:)?Profiles>",
-                    std::regex::icase
-                );
-                for (std::sregex_iterator current(
-                         response.value().begin(), response.value().end(), expression
-                     ), end;
-                     current != end;
-                     ++current)
-                {
-                    const auto token = attribute((*current)[1].str(), "token");
-                    output.push_back({token, first_element((*current)[2].str(), "Name")});
-                    const std::regex ptz_configuration(
-                        "<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?PTZConfiguration\\b([^>]*)>",
-                        std::regex::icase
-                    );
-                    std::smatch configuration;
-                    const auto profile_body = (*current)[2].str();
-                    if (std::regex_search(profile_body, configuration, ptz_configuration))
+                const std::string& xml = response.value();
+                detail_xml::for_each_element(
+                    xml,
+                    "Profiles",
+                    [&](const detail_xml::Element& profile)
                     {
-                        std::lock_guard lock(profile_mutex_);
-                        ptz_configurations_[token] = attribute(configuration[1].str(), "token");
+                        const auto token =
+                            attribute(detail_xml::attributes(xml, profile), "token");
+                        const auto body = std::string(detail_xml::inner(xml, profile));
+                        output.push_back({token, first_element(body, "Name")});
+                        const auto configuration =
+                            detail_xml::find_element(body, "PTZConfiguration");
+                        if (configuration)
+                        {
+                            std::lock_guard lock(profile_mutex_);
+                            ptz_configurations_[token] =
+                                attribute(detail_xml::attributes(body, *configuration), "token");
+                        }
                     }
-                }
+                );
                 return output;
             }
 
@@ -231,6 +259,11 @@ namespace wlonvif
 
             Result<PtzSpaces> ptz_spaces(const ProfileToken& profile) override
             {
+                {
+                    std::lock_guard lock(profile_mutex_);
+                    const auto cached = ptz_spaces_.find(profile);
+                    if (cached != ptz_spaces_.end()) return cached->second;
+                }
                 auto endpoint = service_endpoint(Service::ptz);
                 if (!endpoint) return endpoint.error();
                 std::string configuration;
@@ -264,13 +297,62 @@ namespace wlonvif
                 );
                 if (!response) return response.error();
                 PtzSpaces output;
-                const auto pan_tilt = first_element(
-                    response.value(), "ContinuousPanTiltVelocitySpace"
-                );
-                const auto zoom = first_element(response.value(), "ContinuousZoomVelocitySpace");
-                if (auto range = first_range(pan_tilt, "XRange")) output.pan = *range;
-                if (auto range = first_range(pan_tilt, "YRange")) output.tilt = *range;
-                if (auto range = first_range(zoom, "XRange")) output.zoom = *range;
+                const auto spaces = subtree(response.value(), "Spaces");
+                const auto parse_2d = [&](std::string_view name, auto& destination)
+                {
+                    detail_xml::for_each_element(
+                        spaces,
+                        name,
+                        [&](const detail_xml::Element& element)
+                        {
+                            const auto body = std::string(detail_xml::inner(spaces, element));
+                            const auto x = first_range(body, "XRange");
+                            const auto y = first_range(body, "YRange");
+                            if (x && y)
+                                destination.push_back({first_element(body, "URI"), *x, *y});
+                        }
+                    );
+                };
+                const auto parse_1d = [&](std::string_view name, auto& destination)
+                {
+                    detail_xml::for_each_element(
+                        spaces,
+                        name,
+                        [&](const detail_xml::Element& element)
+                        {
+                            const auto body = std::string(detail_xml::inner(spaces, element));
+                            const auto x = first_range(body, "XRange");
+                            if (x) destination.push_back({first_element(body, "URI"), *x});
+                        }
+                    );
+                };
+                parse_2d("AbsolutePanTiltPositionSpace", output.absolute_pan_tilt);
+                parse_1d("AbsoluteZoomPositionSpace", output.absolute_zoom);
+                parse_2d("RelativePanTiltTranslationSpace", output.relative_pan_tilt);
+                parse_1d("RelativeZoomTranslationSpace", output.relative_zoom);
+                parse_2d("ContinuousPanTiltVelocitySpace", output.continuous_pan_tilt);
+                parse_1d("ContinuousZoomVelocitySpace", output.continuous_zoom);
+                const auto& pan_tilt = !output.continuous_pan_tilt.empty()
+                                           ? output.continuous_pan_tilt.front()
+                                           : !output.absolute_pan_tilt.empty()
+                                                 ? output.absolute_pan_tilt.front()
+                                                 : !output.relative_pan_tilt.empty()
+                                                       ? output.relative_pan_tilt.front()
+                                                       : PtzSpace2D{};
+                const auto& zoom = !output.continuous_zoom.empty()
+                                       ? output.continuous_zoom.front()
+                                       : !output.absolute_zoom.empty()
+                                             ? output.absolute_zoom.front()
+                                             : !output.relative_zoom.empty()
+                                                   ? output.relative_zoom.front()
+                                                   : PtzSpace1D{};
+                output.pan = pan_tilt.x;
+                output.tilt = pan_tilt.y;
+                output.zoom = zoom.x;
+                {
+                    std::lock_guard lock(profile_mutex_);
+                    ptz_spaces_.insert_or_assign(profile, output);
+                }
                 return output;
             }
 
@@ -288,23 +370,44 @@ namespace wlonvif
                 PtzStatus status;
                 auto ranges = ptz_spaces(profile);
                 if (!ranges) return ranges.error();
+                const auto position_pan_tilt = ranges.value().absolute_pan_tilt.empty()
+                                                   ? PtzSpace2D{"", ranges.value().pan, ranges.value().tilt}
+                                                   : ranges.value().absolute_pan_tilt.front();
+                const auto position_zoom = ranges.value().absolute_zoom.empty()
+                                               ? PtzSpace1D{"", ranges.value().zoom}
+                                               : ranges.value().absolute_zoom.front();
+                bool position_seen = false;
                 if (auto value = numeric_attribute(response.value(), "PanTilt", "x"))
                 {
-                    auto normalized = normalize_ptz(*value, ranges.value().pan);
+                    position_seen = true;
+                    auto normalized = normalize_ptz(*value, position_pan_tilt.x);
                     if (normalized) status.position.pan = normalized.value();
+                    else status.position_reliable = false;
                 }
                 if (auto value = numeric_attribute(response.value(), "PanTilt", "y"))
                 {
-                    auto normalized = normalize_ptz(*value, ranges.value().tilt);
+                    position_seen = true;
+                    auto normalized = normalize_ptz(*value, position_pan_tilt.y);
                     if (normalized) status.position.tilt = normalized.value();
+                    else status.position_reliable = false;
                 }
                 if (auto value = numeric_attribute(response.value(), "Zoom", "x"))
                 {
-                    auto normalized = normalize_ptz(*value, ranges.value().zoom);
+                    position_seen = true;
+                    auto normalized = normalize_ptz(*value, position_zoom.x);
                     if (normalized) status.position.zoom = normalized.value();
+                    else status.position_reliable = false;
                 }
-                const auto move = first_element(response.value(), "MoveStatus");
-                status.moving = move.find("MOVING") != std::string::npos;
+                const auto move = subtree(response.value(), "MoveStatus");
+                const auto pan_tilt = first_element(move, "PanTilt");
+                const auto zoom = first_element(move, "Zoom");
+                if (!pan_tilt.empty()) status.pan_tilt_moving = pan_tilt == "MOVING";
+                if (!zoom.empty()) status.zoom_moving = zoom == "MOVING";
+                status.moving = status.pan_tilt_moving.value_or(false) ||
+                                status.zoom_moving.value_or(false) ||
+                                first_element(response.value(), "MoveStatus").find("MOVING") !=
+                                    std::string::npos;
+                if (!position_seen) status.position_reliable = false;
                 return status;
             }
 
@@ -315,34 +418,147 @@ namespace wlonvif
                 if (!endpoint) return endpoint.error();
                 auto ranges = ptz_spaces(profile);
                 if (!ranges) return ranges.error();
+                const auto pan_tilt_space = relative
+                                                ? (ranges.value().relative_pan_tilt.empty()
+                                                       ? PtzSpace2D{"", ranges.value().pan, ranges.value().tilt}
+                                                       : ranges.value().relative_pan_tilt.front())
+                                                : (ranges.value().continuous_pan_tilt.empty()
+                                                       ? PtzSpace2D{"", ranges.value().pan, ranges.value().tilt}
+                                                       : ranges.value().continuous_pan_tilt.front());
+                const auto zoom_space = relative
+                                            ? (ranges.value().relative_zoom.empty()
+                                                   ? PtzSpace1D{"", ranges.value().zoom}
+                                                   : ranges.value().relative_zoom.front())
+                                            : (ranges.value().continuous_zoom.empty()
+                                                   ? PtzSpace1D{"", ranges.value().zoom}
+                                                   : ranges.value().continuous_zoom.front());
                 const auto native = [](std::optional<double> value, NativeRange range)
                 {
                     if (!value) return value;
                     auto converted = denormalize_ptz(*value, range);
                     return converted ? std::optional<double>(converted.value()) : std::nullopt;
                 };
-                vector.pan = native(vector.pan, ranges.value().pan);
-                vector.tilt = native(vector.tilt, ranges.value().tilt);
-                vector.zoom = native(vector.zoom, ranges.value().zoom);
-                std::ostringstream body;
-                body << "<tptz:ProfileToken>" << xml_escape(profile) << "</tptz:ProfileToken>";
-                body << (relative ? "<tptz:Translation>" : "<tptz:Velocity>");
+                vector.pan = native(vector.pan, pan_tilt_space.x);
+                vector.tilt = native(vector.tilt, pan_tilt_space.y);
+                vector.zoom = native(vector.zoom, zoom_space.x);
+                // Stream formatting would emit the global locale's decimal separator
+                // and truncate to six significant digits; XML doubles are neither.
+                const auto& number = detail_xml::format_double;
+                std::string body;
+                body += "<tptz:ProfileToken>" + xml_escape(profile) + "</tptz:ProfileToken>";
+                body += relative ? "<tptz:Translation>" : "<tptz:Velocity>";
                 if (vector.pan || vector.tilt)
                 {
-                    body << "<tt:PanTilt";
-                    if (vector.pan) body << " x=\"" << *vector.pan << '"';
-                    if (vector.tilt) body << " y=\"" << *vector.tilt << '"';
-                    body << "/>";
+                    body += "<tt:PanTilt";
+                    if (!pan_tilt_space.uri.empty())
+                        body += " space=\"" + xml_escape(pan_tilt_space.uri) + '"';
+                    if (vector.pan) body += " x=\"" + number(*vector.pan) + '"';
+                    if (vector.tilt) body += " y=\"" + number(*vector.tilt) + '"';
+                    body += "/>";
                 }
-                if (vector.zoom) body << "<tt:Zoom x=\"" << *vector.zoom << "\"/>";
-                body << (relative ? "</tptz:Translation>" : "</tptz:Velocity>");
+                if (vector.zoom)
+                {
+                    body += "<tt:Zoom";
+                    if (!zoom_space.uri.empty())
+                        body += " space=\"" + xml_escape(zoom_space.uri) + '"';
+                    body += " x=\"" + number(*vector.zoom) + "\"/>";
+                }
+                body += relative ? "</tptz:Translation>" : "</tptz:Velocity>";
                 const auto operation =
                     relative ? OperationId::relative_move : OperationId::continuous_move;
                 auto response = invoke(
                     endpoint.value(),
                     operation,
-                    body.str(),
+                    body,
                     relative ? "RelativeMoveResponse" : "ContinuousMoveResponse"
+                );
+                if (!response)
+                {
+                    auto error = response.error();
+                    error.request_may_have_been_applied = true;
+                    return error;
+                }
+                return MoveResult{true, std::nullopt};
+            }
+
+            Result<MoveResult> absolute_move(
+                const ProfileToken& profile,
+                PtzVector position,
+                std::optional<PtzVector> speed
+            ) override
+            {
+                auto endpoint = service_endpoint(Service::ptz);
+                if (!endpoint) return endpoint.error();
+                auto ranges = ptz_spaces(profile);
+                if (!ranges) return ranges.error();
+                if (ranges.value().absolute_pan_tilt.empty() &&
+                    ranges.value().absolute_zoom.empty())
+                {
+                    return Error{
+                        ErrorCategory::unsupported,
+                        OperationId::absolute_move,
+                        "device advertises no absolute PTZ position space"
+                    };
+                }
+                const auto pan_tilt = ranges.value().absolute_pan_tilt.empty()
+                                          ? PtzSpace2D{"", ranges.value().pan, ranges.value().tilt}
+                                          : ranges.value().absolute_pan_tilt.front();
+                const auto zoom = ranges.value().absolute_zoom.empty()
+                                      ? PtzSpace1D{"", ranges.value().zoom}
+                                      : ranges.value().absolute_zoom.front();
+                const auto velocity_pan_tilt = ranges.value().continuous_pan_tilt.empty()
+                                                   ? PtzSpace2D{"", ranges.value().pan, ranges.value().tilt}
+                                                   : ranges.value().continuous_pan_tilt.front();
+                const auto velocity_zoom = ranges.value().continuous_zoom.empty()
+                                               ? PtzSpace1D{"", ranges.value().zoom}
+                                               : ranges.value().continuous_zoom.front();
+                const auto native = [](std::optional<double> value, NativeRange range)
+                {
+                    if (!value) return value;
+                    auto converted = denormalize_ptz(*value, range);
+                    return converted ? std::optional<double>(converted.value()) : std::nullopt;
+                };
+                position.pan = native(position.pan, pan_tilt.x);
+                position.tilt = native(position.tilt, pan_tilt.y);
+                position.zoom = native(position.zoom, zoom.x);
+                if (speed)
+                {
+                    speed->pan = native(speed->pan, velocity_pan_tilt.x);
+                    speed->tilt = native(speed->tilt, velocity_pan_tilt.y);
+                    speed->zoom = native(speed->zoom, velocity_zoom.x);
+                }
+                const auto append = [&](std::string& body, const PtzVector& vector, bool velocity)
+                {
+                    const auto& number = detail_xml::format_double;
+                    if (vector.pan || vector.tilt)
+                    {
+                        body += "<tt:PanTilt";
+                        const auto& uri = velocity ? velocity_pan_tilt.uri : pan_tilt.uri;
+                        if (!uri.empty()) body += " space=\"" + xml_escape(uri) + '"';
+                        if (vector.pan) body += " x=\"" + number(*vector.pan) + '"';
+                        if (vector.tilt) body += " y=\"" + number(*vector.tilt) + '"';
+                        body += "/>";
+                    }
+                    if (vector.zoom)
+                    {
+                        body += "<tt:Zoom";
+                        const auto& uri = velocity ? velocity_zoom.uri : zoom.uri;
+                        if (!uri.empty()) body += " space=\"" + xml_escape(uri) + '"';
+                        body += " x=\"" + number(*vector.zoom) + "\"/>";
+                    }
+                };
+                std::string body = "<tptz:ProfileToken>" + xml_escape(profile) +
+                                   "</tptz:ProfileToken><tptz:Position>";
+                append(body, position, false);
+                body += "</tptz:Position>";
+                if (speed)
+                {
+                    body += "<tptz:Speed>";
+                    append(body, *speed, true);
+                    body += "</tptz:Speed>";
+                }
+                auto response = invoke(
+                    endpoint.value(), OperationId::absolute_move, body, "AbsoluteMoveResponse"
                 );
                 if (!response)
                 {
@@ -379,26 +595,41 @@ namespace wlonvif
                     "GetPresetsResponse"
                 );
                 if (!response) return response.error();
-                std::vector<Preset> output;
-                const std::regex expression(
-                    "<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?Preset\\b([^>]*)>([\\s\\S]*?)"
-                    "</(?:[A-Za-z_][A-Za-z0-9_.-]*:)?Preset>",
-                    std::regex::icase
-                );
-                for (std::sregex_iterator current(
-                         response.value().begin(), response.value().end(), expression
-                     ), end;
-                     current != end;
-                     ++current)
+                // Preset positions are advertised in the device's native units, but
+                // PtzVector is defined as normalized [-1, +1]. Publishing the raw
+                // values would make a preset position unusable as a move argument.
+                std::optional<PtzSpaces> ranges;
+                if (auto spaces = ptz_spaces(profile)) ranges = spaces.value();
+                const auto normalized =
+                    [&](std::optional<double> value, NativeRange range) -> std::optional<double>
                 {
-                    Preset preset;
-                    preset.token = attribute((*current)[1].str(), "token");
-                    preset.name = first_element((*current)[2].str(), "Name");
-                    preset.position.pan = numeric_attribute((*current)[2].str(), "PanTilt", "x");
-                    preset.position.tilt = numeric_attribute((*current)[2].str(), "PanTilt", "y");
-                    preset.position.zoom = numeric_attribute((*current)[2].str(), "Zoom", "x");
-                    output.push_back(std::move(preset));
-                }
+                    if (!ranges || !value) return std::nullopt;
+                    auto converted = normalize_ptz(*value, range);
+                    return converted ? std::optional<double>(converted.value()) : std::nullopt;
+                };
+                std::vector<Preset> output;
+                const std::string& xml = response.value();
+                detail_xml::for_each_element(
+                    xml,
+                    "Preset",
+                    [&](const detail_xml::Element& element)
+                    {
+                        Preset preset;
+                        preset.token = attribute(detail_xml::attributes(xml, element), "token");
+                        const auto body = std::string(detail_xml::inner(xml, element));
+                        preset.name = first_element(body, "Name");
+                        const auto pan_tilt = ranges ? ranges->pan : NativeRange{};
+                        const auto tilt = ranges ? ranges->tilt : NativeRange{};
+                        const auto zoom = ranges ? ranges->zoom : NativeRange{};
+                        preset.position.pan =
+                            normalized(numeric_attribute(body, "PanTilt", "x"), pan_tilt);
+                        preset.position.tilt =
+                            normalized(numeric_attribute(body, "PanTilt", "y"), tilt);
+                        preset.position.zoom =
+                            normalized(numeric_attribute(body, "Zoom", "x"), zoom);
+                        output.push_back(std::move(preset));
+                    }
+                );
                 return output;
             }
 
@@ -432,7 +663,10 @@ namespace wlonvif
                         "CreatePullPointSubscriptionResponse"
                     );
                     if (!subscribed) return subscribed.error();
-                    subscription_url_ = first_element(subscribed.value(), "Address");
+                    // The address must come from the SubscriptionReference; the
+                    // envelope also carries wsa:Address elements in its header.
+                    const auto reference = subtree(subscribed.value(), "SubscriptionReference");
+                    subscription_url_ = first_element(reference, "Address");
                     if (subscription_url_.empty())
                     {
                         return Error{
@@ -455,38 +689,61 @@ namespace wlonvif
                     return response.error();
                 }
                 std::vector<Event> output;
-                const std::regex notification(
-                    "<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?NotificationMessage\\b[^>]*>"
-                    "([\\s\\S]*?)</(?:[A-Za-z_][A-Za-z0-9_.-]*:)?NotificationMessage>",
-                    std::regex::icase
-                );
-                for (std::sregex_iterator current(
-                         response.value().begin(), response.value().end(), notification
-                     ), end;
-                     current != end;
-                     ++current)
-                {
-                    Event event;
-                    event.topic = first_element((*current)[1].str(), "Topic");
-                    event.utc_time = std::chrono::system_clock::now();
-                    const std::regex item(
-                        "<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?SimpleItem\\b([^>]*)/?>",
-                        std::regex::icase
-                    );
-                    for (std::sregex_iterator value(
-                             (*current)[1].first, (*current)[1].second, item
-                         );
-                         value != std::sregex_iterator{};
-                         ++value)
+                const std::string& xml = response.value();
+                detail_xml::for_each_element(
+                    xml,
+                    "NotificationMessage",
+                    [&](const detail_xml::Element& element)
                     {
-                        const auto name = attribute((*value)[1].str(), "Name");
-                        const auto data = attribute((*value)[1].str(), "Value");
-                        if (event.source.empty()) event.source = name + '=' + data;
-                        else event.data += (event.data.empty() ? "" : ",") + name + '=' + data;
+                        Event event;
+                        const auto body = std::string(detail_xml::inner(xml, element));
+                        event.topic = first_element(body, "Topic");
+                        // ONVIF puts SimpleItems under both Source and Data. Taking
+                        // the first item as the source and lumping the rest into data
+                        // misfiles every message with more than one source item.
+                        const auto message = detail_xml::find_element(body, "Message");
+                        const auto payload = message
+                                                 ? std::string(detail_xml::inner(body, *message))
+                                                 : body;
+                        const auto source = detail_xml::find_element(payload, "Source");
+                        const auto data = detail_xml::find_element(payload, "Data");
+                        if (source || data)
+                        {
+                            if (source)
+                            {
+                                event.source =
+                                    simple_items(detail_xml::inner(payload, *source));
+                            }
+                            if (data)
+                            {
+                                event.data = simple_items(detail_xml::inner(payload, *data));
+                            }
+                        }
+                        else
+                        {
+                            event.data = simple_items(payload);
+                        }
+                        // Message carries the device's own UtcTime; falling back to
+                        // the local clock only when the device omits or mangles it.
+                        std::string stamp;
+                        if (message)
+                        {
+                            const auto inner_message =
+                                detail_xml::find_element(payload, "Message");
+                            stamp = attribute(
+                                inner_message
+                                    ? detail_xml::attributes(payload, *inner_message)
+                                    : detail_xml::attributes(body, *message),
+                                "UtcTime"
+                            );
+                        }
+                        const auto parsed = parse_xsd_datetime(stamp);
+                        event.utc_time =
+                            parsed ? *parsed : std::chrono::system_clock::now();
+                        event.sequence = next_sequence_++;
+                        output.push_back(std::move(event));
                     }
-                    event.sequence = next_sequence_++;
-                    output.push_back(std::move(event));
-                }
+                );
                 return output;
             }
 
@@ -524,8 +781,16 @@ namespace wlonvif
 
             Result<std::string> service_endpoint(Service service)
             {
-                std::lock_guard lock(capabilities_mutex_);
-                if (!capabilities_loaded_)
+                // GetCapabilities must not run while the lock is held. A safety Stop
+                // would otherwise queue behind whatever request is already in flight,
+                // for the full duration of that request's timeout. Racing callers may
+                // each issue one GetCapabilities; the results are identical.
+                bool loaded = false;
+                {
+                    std::lock_guard lock(capabilities_mutex_);
+                    loaded = capabilities_loaded_;
+                }
+                if (!loaded)
                 {
                     auto response = invoke(
                         device_url_,
@@ -534,14 +799,23 @@ namespace wlonvif
                         "GetCapabilitiesResponse"
                     );
                     if (!response) return response.error();
-                    media_url_ = endpoint_in(response.value(), "Media");
-                    ptz_url_ = endpoint_in(response.value(), "PTZ");
-                    event_url_ = endpoint_in(response.value(), "Events");
-                    capabilities_loaded_ = true;
+                    auto media = endpoint_in(response.value(), "Media");
+                    auto ptz = endpoint_in(response.value(), "PTZ");
+                    auto events = endpoint_in(response.value(), "Events");
+                    std::lock_guard lock(capabilities_mutex_);
+                    if (!capabilities_loaded_)
+                    {
+                        media_url_ = std::move(media);
+                        ptz_url_ = std::move(ptz);
+                        event_url_ = std::move(events);
+                        capabilities_loaded_ = true;
+                    }
                 }
-                const auto& endpoint = service == Service::media   ? media_url_
-                                       : service == Service::ptz ? ptz_url_
-                                                                  : event_url_;
+                std::unique_lock lock(capabilities_mutex_);
+                const auto endpoint = service == Service::media ? media_url_
+                                      : service == Service::ptz ? ptz_url_
+                                                                : event_url_;
+                lock.unlock();
                 if (endpoint.empty())
                 {
                     return Error{
@@ -595,18 +869,9 @@ namespace wlonvif
 
             static std::string endpoint_in(std::string_view xml, std::string_view service)
             {
-                const std::regex expression(
-                    "<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?" + std::string(service) +
-                        "\\b[^>]*>([\\s\\S]*?)</(?:[A-Za-z_][A-Za-z0-9_.-]*:)?" +
-                        std::string(service) + ">",
-                    std::regex::icase
-                );
-                std::match_results<std::string_view::const_iterator> match;
-                return std::regex_search(xml.begin(), xml.end(), match, expression)
-                           ? first_element(
-                                 std::string_view(match[1].first, match[1].second), "XAddr"
-                             )
-                           : std::string{};
+                const auto element = detail_xml::find_element(xml, service);
+                return element ? first_element(detail_xml::inner(xml, *element), "XAddr")
+                               : std::string{};
             }
 
             static MediaUri media_uri(const std::string& xml)
@@ -632,6 +897,7 @@ namespace wlonvif
             std::uint64_t next_sequence_{};
             std::mutex profile_mutex_;
             std::map<ProfileToken, std::string> ptz_configurations_;
+            std::map<ProfileToken, PtzSpaces> ptz_spaces_;
         };
     } // namespace
 

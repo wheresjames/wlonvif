@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: "4"
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  # Debug and Release/shared builds plus the installed-package consumer smoke
+  # test, across both supported compilers.
+  build:
+    name: build (${{ matrix.compiler }}, ${{ matrix.build_type }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libcurl4-openssl-dev libxml2-dev libssl-dev
+      - name: Select compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CC=clang" >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          else
+            echo "CC=gcc" >> "$GITHUB_ENV"
+            echo "CXX=g++" >> "$GITHUB_ENV"
+          fi
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DWLONVIF_BUILD_TESTING=ON
+          -DWLONVIF_BUILD_EXAMPLES=ON
+          -DWLONVIF_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Installed package consumes cleanly
+        run: |
+          cmake --install build --prefix "$PWD/build/install-smoke"
+          cmake -S tests/consumer -B build/consumer -G Ninja \
+            -DCMAKE_PREFIX_PATH="$PWD/build/install-smoke"
+          cmake --build build/consumer
+          ./build/consumer/wlonvif_consumer
+
+  # A shared-library build catches visibility and link-interface mistakes that a
+  # static build hides.
+  shared:
+    name: shared library
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libcurl4-openssl-dev libxml2-dev libssl-dev
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_SHARED_LIBS=ON
+          -DWLONVIF_BUILD_TESTING=ON
+          -DWLONVIF_BUILD_EXAMPLES=ON
+          -DWLONVIF_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # Address/UB and Thread sanitizers need separate trees; they cannot be
+  # combined. Every historic defect in this library that reached a shipped
+  # release was reachable from one of these two.
+  sanitizers:
+    name: sanitizers (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: address-undefined
+            flags: -DWLONVIF_ENABLE_SANITIZERS=ON
+          - sanitizer: thread
+            flags: -DWLONVIF_ENABLE_THREAD_SANITIZER=ON
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libcurl4-openssl-dev libxml2-dev libssl-dev
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DWLONVIF_BUILD_TESTING=ON
+          -DWLONVIF_BUILD_EXAMPLES=ON
+          -DWLONVIF_WARNINGS_AS_ERRORS=ON
+          ${{ matrix.flags }}
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=0:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build --output-on-failure
+
+  # A short gate, not a fuzzing campaign: both targets read untrusted input, the
+  # scanner directly from unauthenticated WS-Discovery datagrams.
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang libcurl4-openssl-dev libxml2-dev libssl-dev
+      - name: Configure
+        run: >
+          cmake -S . -B build-fuzz -G Ninja
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_BUILD_TYPE=Debug
+          -DWLONVIF_BUILD_TESTING=OFF
+          -DWLONVIF_BUILD_FUZZERS=ON
+      - name: Build
+        run: cmake --build build-fuzz
+      # libFuzzer writes discovered inputs into the first corpus directory given,
+      # so that one is scratch space; the checked-in seeds are read-only.
+      - name: Fuzz the SOAP reader
+        run: |
+          mkdir -p build-fuzz/corpus/xml
+          ./build-fuzz/wlonvif_xml_fuzzer -max_total_time=60 -max_len=8192 \
+            build-fuzz/corpus/xml tests/fuzz/seeds/xml
+      - name: Fuzz the XML scanner
+        run: |
+          mkdir -p build-fuzz/corpus/xml_scan
+          ./build-fuzz/wlonvif_xml_scan_fuzzer -max_total_time=60 -max_len=8192 \
+            build-fuzz/corpus/xml_scan tests/fuzz/seeds/xml_scan
+      - name: Preserve any crash reproducer
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore

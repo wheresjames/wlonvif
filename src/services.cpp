@@ -81,6 +81,32 @@ namespace wlonvif
         {
             return Error{ErrorCategory::invalid_argument, operation, std::move(message)};
         }
+
+        /**
+         * @brief Call options for a best-effort safety Stop.
+         *
+         * A Stop exists to halt motion, so it must not inherit the very cancellation
+         * or expiry that prompted it: the transport refuses a request carrying a
+         * cancelled token, which would silently drop the Stop at the moment it
+         * matters most. The caller's deadline is kept when it is still ahead.
+         */
+        CallOptions safety_options(const CallOptions& requested)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            return CallOptions{
+                requested.deadline > now ? requested.deadline : now + std::chrono::seconds(5),
+                CancellationSource{}.token()
+            };
+        }
+
+        bool valid_ptz_vector(const PtzVector& vector)
+        {
+            const auto valid = [](const std::optional<double>& value)
+            {
+                return !value || (std::isfinite(*value) && *value >= -1 && *value <= 1);
+            };
+            return valid(vector.pan) && valid(vector.tilt) && valid(vector.zoom);
+        }
     } // namespace
 
     Result<double> normalize_ptz(double value, NativeRange range)
@@ -159,7 +185,7 @@ namespace wlonvif
         return async_call<PtzSpaces>(
             runtime_,
             o,
-            OperationId::ptz_status,
+            OperationId::get_ptz_configuration_options,
             [b, t = std::move(t)]
             {
                 return b->ptz_spaces(t);
@@ -194,10 +220,20 @@ namespace wlonvif
             relative ? OperationId::relative_move : OperationId::continuous_move,
             [b, t = std::move(t), v, relative, o]() mutable
             {
+                if (!valid_ptz_vector(v))
+                {
+                    return Result<MoveResult>(Error{
+                        ErrorCategory::invalid_argument,
+                        relative ? OperationId::relative_move : OperationId::continuous_move,
+                        "PTZ components must be finite and between -1 and +1"
+                    });
+                }
                 if (o.cancellation.stop_requested() ||
                     std::chrono::steady_clock::now() >= o.deadline)
                 {
+                    set_network_call_options(safety_options(o));
                     auto stopped = b->stop(t);
+                    set_network_call_options(o);
                     Error e{
                         o.cancellation.stop_requested() ? ErrorCategory::cancelled
                                                         : ErrorCategory::timeout,
@@ -225,6 +261,27 @@ namespace wlonvif
     {
         return move_call(runtime_, backend_, std::move(t), v, true, o);
     }
+    Task<Result<MoveResult>> PtzClient::absolute_move(
+        ProfileToken t, PtzVector position, std::optional<PtzVector> speed, CallOptions o
+    )
+    {
+        auto b = backend_;
+        return async_call<MoveResult>(
+            runtime_,
+            o,
+            OperationId::absolute_move,
+            [b, t = std::move(t), position, speed]
+            {
+                if (!valid_ptz_vector(position) || (speed && !valid_ptz_vector(*speed)))
+                    return Result<MoveResult>(Error{
+                        ErrorCategory::invalid_argument,
+                        OperationId::absolute_move,
+                        "PTZ components must be finite and between -1 and +1"
+                    });
+                return b->absolute_move(t, position, speed);
+            }
+        );
+    }
     Task<Result<void>> PtzClient::stop(ProfileToken t, CallOptions o)
     {
         auto b = backend_;
@@ -240,7 +297,24 @@ namespace wlonvif
     }
     Task<Result<void>> PtzClient::emergency_stop(ProfileToken t, CallOptions o)
     {
-        return stop(std::move(t), o);
+        auto b = backend_;
+        // A safety Stop has to reach the device even when the caller's token is
+        // already cancelled or its deadline already passed. Skipping the precheck
+        // is only half of that: the request itself must also travel under an
+        // uncancelled token, or the transport refuses it before it reaches the wire.
+        return async_call<void>(
+            runtime_,
+            o,
+            OperationId::ptz_stop,
+            [b, t = std::move(t), o]
+            {
+                set_network_call_options(safety_options(o));
+                auto stopped = b->stop(t);
+                set_network_call_options(o);
+                return stopped;
+            },
+            false
+        );
     }
     Task<Result<std::vector<Preset>>> PtzClient::get_presets(ProfileToken t, CallOptions o)
     {
@@ -274,13 +348,34 @@ namespace wlonvif
         std::mutex mutex;
         std::deque<DiscoveryObservation> queue;
         std::unordered_set<std::string> seen;
+        std::deque<std::string> seen_order;
         std::size_t maximum;
+        std::size_t maximum_seen;
         bool closed{false};
+
+        /// Requires mutex. Record @p key, returning false when it was already seen.
+        bool remember(std::string key)
+        {
+            if (!seen.insert(key).second)
+            {
+                return false;
+            }
+            // The queue is bounded but the deduplication keys are attacker-supplied
+            // datagram fields, so they need their own bound to stay memory-safe.
+            seen_order.push_back(std::move(key));
+            while (seen_order.size() > maximum_seen)
+            {
+                seen.erase(seen_order.front());
+                seen_order.pop_front();
+            }
+            return true;
+        }
     };
     DiscoverySession::DiscoverySession(std::shared_ptr<Runtime> r, std::size_t m)
         : state_(std::make_shared<State>()), runtime_(std::move(r))
     {
         state_->maximum = m;
+        state_->maximum_seen = std::max<std::size_t>(m * 4, 256);
     }
     Task<Result<void>> DiscoverySession::inject(DiscoveryObservation v, CallOptions o)
     {
@@ -298,7 +393,7 @@ namespace wlonvif
                 }
                 auto key = v.endpoint_reference + '|' + v.source + '|' + v.interface_id + '|' +
                            std::to_string(v.message_number);
-                if (!s->seen.insert(key).second)
+                if (!s->remember(std::move(key)))
                 {
                     return Result<void>();
                 }
@@ -361,8 +456,45 @@ namespace wlonvif
         std::mutex mutex;
         std::deque<EventOrHealth> queue;
         std::size_t maximum;
-        std::size_t dropped{};
         bool closed{false};
+
+        static bool is_loss_marker(const EventOrHealth& item)
+        {
+            const auto* health = std::get_if<StreamHealth>(&item);
+            return health && *health == StreamHealth::events_dropped;
+        }
+
+        /**
+         * @brief Requires mutex. Append @p item, honouring the queue bound.
+         *
+         * Whenever entries are discarded a single events_dropped marker is folded
+         * into the head of the queue. Keeping the marker in band means the consumer
+         * is told about the loss even while the queue stays permanently full, and
+         * counting it against the bound means the queue never exceeds its maximum.
+         */
+        void push(EventOrHealth item)
+        {
+            if (maximum == 0)
+            {
+                return;
+            }
+            bool discarded = false;
+            while (queue.size() + 1 > maximum)
+            {
+                queue.pop_front();
+                discarded = true;
+            }
+            queue.push_back(std::move(item));
+            if (!discarded || (!queue.empty() && is_loss_marker(queue.front())))
+            {
+                return;
+            }
+            while (queue.size() + 1 > maximum)
+            {
+                queue.pop_front();
+            }
+            queue.push_front(StreamHealth::events_dropped);
+        }
     };
     ManagedEventStream::ManagedEventStream(
         std::shared_ptr<Runtime> r, std::shared_ptr<ServiceBackend> b, std::size_t m
@@ -398,17 +530,7 @@ namespace wlonvif
                 }
                 for (auto& e : events.value())
                 {
-                    if (s->queue.size() >= s->maximum)
-                    {
-                        s->queue.pop_front();
-                        ++s->dropped;
-                    }
-                    s->queue.emplace_back(std::move(e));
-                }
-                if (s->dropped && s->queue.size() < s->maximum)
-                {
-                    s->queue.emplace_back(StreamHealth::events_dropped);
-                    s->dropped = 0;
+                    s->push(std::move(e));
                 }
                 return Result<void>();
             }
@@ -448,11 +570,13 @@ namespace wlonvif
             [s]
             {
                 std::lock_guard l(s->mutex);
-                if (s->queue.size() >= s->maximum)
+                if (s->closed)
                 {
-                    s->queue.pop_front();
+                    return Result<void>(Error{ErrorCategory::closed, OperationId::event_renew});
                 }
-                s->queue.emplace_back(StreamHealth::possible_event_loss);
+                // Enqueueing through push() means an event evicted to make room for
+                // this marker is still reported as a drop, rather than vanishing.
+                s->push(StreamHealth::possible_event_loss);
                 return Result<void>();
             }
         );

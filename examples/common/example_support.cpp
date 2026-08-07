@@ -158,6 +158,56 @@ namespace wlonvif::examples
 
         std::mutex credential_prompt_mutex;
         std::optional<Credentials> prompted_credentials;
+
+        /**
+         * @brief True when @p error looks like a device that cannot answer cleartext Digest.
+         *
+         * Over plain HTTP the client offers only Digest, and several camera families
+         * accept the connection and then hang up rather than answering the challenge.
+         *
+         * The non-retryable flag is what separates this from an ordinary transport
+         * fault: the transport clears it only for a peer that accepted the connection
+         * and then dropped an authenticated exchange. Testing the category alone would
+         * blame Digest for a refused connection or an unplugged cable.
+         */
+        bool suggests_cleartext_basic(
+            const Error& error,
+            const std::string& url,
+            const std::optional<Credentials>& credentials
+        )
+        {
+            if (!credentials || credentials->allow_cleartext_basic)
+            {
+                return false;
+            }
+            if (!url.starts_with("http://"))
+            {
+                return false;
+            }
+            if (error.retryable)
+            {
+                return false;
+            }
+            return error.category == ErrorCategory::network ||
+                   error.category == ErrorCategory::malformed_http;
+        }
+
+        void warn_cleartext_basic(bool device_answered_anonymously)
+        {
+            std::cerr
+                << '\n'
+                << (device_answered_anonymously
+                        ? "Warning: the device replied before credentials were supplied, then\n"
+                          "         dropped the authenticated request.\n"
+                        : "Warning: the device dropped the authenticated request.\n")
+                << "         Over cleartext HTTP only Digest authentication is offered, and\n"
+                   "         some cameras cannot process it.\n"
+                   "\n"
+                   "         Retry with --allow-cleartext-basic.\n"
+                   "\n"
+                   "         Devices that authenticate with a WS-Security UsernameToken send\n"
+                   "         no HTTP challenge, so no password is transmitted in cleartext.\n\n";
+        }
     } // namespace
 
     Result<ParsedArguments> parse_common_arguments(int argc, char** argv)
@@ -359,6 +409,10 @@ namespace wlonvif::examples
         }
         if (probe.error().category != ErrorCategory::authentication || !input_is_terminal())
         {
+            if (suggests_cleartext_basic(probe.error(), url, credentials))
+            {
+                warn_cleartext_basic(false);
+            }
             return probe.error();
         }
 
@@ -392,6 +446,13 @@ namespace wlonvif::examples
         probe = probe_access(session.value());
         if (!probe)
         {
+            // The device answered the pre-credential probe with an authentication
+            // error, so it is reachable and speaking ONVIF. A transport failure only
+            // after credentials were attached points squarely at the Digest exchange.
+            if (suggests_cleartext_basic(probe.error(), url, prompted_credentials))
+            {
+                warn_cleartext_basic(true);
+            }
             prompted_credentials.reset();
             return probe.error();
         }

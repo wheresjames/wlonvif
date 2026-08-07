@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <curl/curl.h>
+#include "curl_init.hpp"
+#include "dispatch.hpp"
 #include <wlonvif/wlonvif.hpp>
 
 namespace wlonvif
@@ -28,13 +30,66 @@ namespace wlonvif
         {
             return static_cast<CancellationToken*>(user)->stop_requested() ? 1 : 0;
         }
+        /// Collects the WWW-Authenticate challenge so the auth scheme can be chosen.
+        struct HeaderContext
+        {
+            std::string challenge;
+            static constexpr std::size_t maximum = 4096;
+        };
+        size_t header_cb(char* p, size_t s, size_t n, void* u)
+        {
+            auto& context = *static_cast<HeaderContext*>(u);
+            const auto bytes = s * n;
+            constexpr std::string_view name = "www-authenticate:";
+            std::string_view line(p, bytes);
+            if (line.size() > name.size())
+            {
+                std::string prefix(line.substr(0, name.size()));
+                std::transform(
+                    prefix.begin(),
+                    prefix.end(),
+                    prefix.begin(),
+                    [](unsigned char value) { return static_cast<char>(std::tolower(value)); }
+                );
+                if (prefix == name && context.challenge.size() < HeaderContext::maximum)
+                {
+                    auto value = line.substr(name.size());
+                    while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+                    {
+                        value.remove_prefix(1);
+                    }
+                    while (!value.empty() && (value.back() == '\r' || value.back() == '\n'))
+                    {
+                        value.remove_suffix(1);
+                    }
+                    if (!context.challenge.empty())
+                    {
+                        context.challenge += ", ";
+                    }
+                    context.challenge += value;
+                }
+            }
+            return bytes;
+        }
+        /// Lowercase copy used for case-insensitive scheme matching.
+        std::string lowercase(std::string_view input)
+        {
+            std::string output(input);
+            std::transform(
+                output.begin(),
+                output.end(),
+                output.begin(),
+                [](unsigned char value) { return static_cast<char>(std::tolower(value)); }
+            );
+            return output;
+        }
         class CurlTransport final : public HttpTransport
         {
           public:
             CurlTransport(std::shared_ptr<Runtime> r, XmlLimits l)
                 : runtime_(std::move(r)), limits_(l)
             {
-                curl_global_init(CURL_GLOBAL_DEFAULT);
+                detail::initialize_curl();
             }
             Task<Result<HttpResponse>> send(HttpRequest req, CancellationToken token) override
             {
@@ -48,7 +103,8 @@ namespace wlonvif
                             {
                                 if (token.stop_requested())
                                 {
-                                    rt->post(
+                                    detail::dispatch(
+                                        rt,
                                         [done = std::move(done)]() mutable
                                         {
                                             done(Error{ErrorCategory::cancelled});
@@ -59,7 +115,8 @@ namespace wlonvif
                                 CURL* c = curl_easy_init();
                                 if (!c)
                                 {
-                                    rt->post(
+                                    detail::dispatch(
+                                        rt,
                                         [done = std::move(done)]() mutable
                                         {
                                             done(Error{
@@ -102,22 +159,9 @@ namespace wlonvif
                                 curl_easy_setopt(
                                     c, CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(lim.bytes)
                                 );
-                                if (req.credentials)
-                                {
-                                    curl_easy_setopt(
-                                        c, CURLOPT_USERNAME, req.credentials->username.c_str()
-                                    );
-                                    curl_easy_setopt(
-                                        c, CURLOPT_PASSWORD, req.credentials->password.c_str()
-                                    );
-                                    const bool encrypted = req.url.starts_with("https://");
-                                    const long methods = encrypted ||
-                                                                 req.credentials
-                                                                     ->allow_cleartext_basic
-                                                             ? CURLAUTH_ANY
-                                                             : CURLAUTH_DIGEST | CURLAUTH_NTLM;
-                                    curl_easy_setopt(c, CURLOPT_HTTPAUTH, methods);
-                                }
+                                HeaderContext header_context;
+                                curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, header_cb);
+                                curl_easy_setopt(c, CURLOPT_HEADERDATA, &header_context);
                                 auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
                                                 req.deadline - std::chrono::steady_clock::now()
                                 )
@@ -125,8 +169,89 @@ namespace wlonvif
                                 curl_easy_setopt(
                                     c, CURLOPT_TIMEOUT_MS, static_cast<long>(left > 0 ? left : 1)
                                 );
-                                auto code = curl_easy_perform(c);
+                                const auto perform = [&]
+                                {
+                                    response.body.clear();
+                                    write_context.exceeded = false;
+                                    header_context.challenge.clear();
+                                    return curl_easy_perform(c);
+                                };
+                                // The first attempt carries no HTTP credentials. ONVIF devices
+                                // overwhelmingly authenticate with a WS-Security UsernameToken and
+                                // never issue an HTTP challenge, and engaging libcurl's auth
+                                // machinery unprompted makes it probe with a scheme the device
+                                // never asked for -- which some embedded servers answer by
+                                // dropping the connection.
+                                auto code = perform();
                                 curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &response.status);
+                                bool attempted_cleartext_digest = false;
+                                std::optional<Error> auth_error;
+                                if (code == CURLE_OK && response.status == 401 && req.credentials)
+                                {
+                                    const bool encrypted = req.url.starts_with("https://");
+                                    const auto challenge = lowercase(header_context.challenge);
+                                    const bool basic_offered =
+                                        challenge.find("basic") != std::string::npos;
+                                    long methods = 0;
+                                    if (challenge.find("digest") != std::string::npos)
+                                    {
+                                        methods |= CURLAUTH_DIGEST;
+                                    }
+                                    if (challenge.find("negotiate") != std::string::npos)
+                                    {
+                                        methods |= CURLAUTH_NEGOTIATE;
+                                    }
+                                    if (challenge.find("ntlm") != std::string::npos)
+                                    {
+                                        methods |= CURLAUTH_NTLM;
+                                    }
+                                    // Basic reveals the password to anyone on the path, so it is
+                                    // only offered back when the channel is encrypted or the
+                                    // caller has explicitly accepted the exposure.
+                                    if (basic_offered &&
+                                        (encrypted || req.credentials->allow_cleartext_basic))
+                                    {
+                                        methods |= CURLAUTH_BASIC;
+                                    }
+                                    if (methods != 0)
+                                    {
+                                        attempted_cleartext_digest =
+                                            !encrypted && (methods & CURLAUTH_DIGEST) != 0;
+                                        curl_easy_setopt(
+                                            c, CURLOPT_USERNAME, req.credentials->username.c_str()
+                                        );
+                                        curl_easy_setopt(
+                                            c, CURLOPT_PASSWORD, req.credentials->password.c_str()
+                                        );
+                                        curl_easy_setopt(c, CURLOPT_HTTPAUTH, methods);
+                                        code = perform();
+                                        curl_easy_getinfo(
+                                            c, CURLINFO_RESPONSE_CODE, &response.status
+                                        );
+                                    }
+                                    else if (basic_offered)
+                                    {
+                                        auth_error = Error{
+                                            ErrorCategory::authentication,
+                                            {},
+                                            "the device offers only HTTP Basic authentication over "
+                                            "an unencrypted connection; set "
+                                            "Credentials::allow_cleartext_basic to permit sending "
+                                            "the password in cleartext, or use an https:// endpoint",
+                                            false
+                                        };
+                                    }
+                                    else if (!challenge.empty())
+                                    {
+                                        auth_error = Error{
+                                            ErrorCategory::authentication,
+                                            {},
+                                            "the device requested an unsupported HTTP "
+                                            "authentication scheme",
+                                            false
+                                        };
+                                    }
+                                }
                                 char* ct = nullptr;
                                 curl_easy_getinfo(c, CURLINFO_CONTENT_TYPE, &ct);
                                 if (ct)
@@ -136,7 +261,11 @@ namespace wlonvif
                                 curl_slist_free_all(hs);
                                 curl_easy_cleanup(c);
                                 Result<HttpResponse> result = std::move(response);
-                                if (code != CURLE_OK)
+                                if (auth_error)
+                                {
+                                    result = std::move(*auth_error);
+                                }
+                                else if (code != CURLE_OK)
                                 {
                                     ErrorCategory category = ErrorCategory::network;
                                     std::string message = curl_easy_strerror(code);
@@ -164,9 +293,36 @@ namespace wlonvif
                                         message = "HTTP response size limit exceeded";
                                         retryable = false;
                                     }
+                                    // A peer that accepts the connection and then hangs up
+                                    // mid-exchange, but only once credentials are attached, is
+                                    // almost always an embedded HTTP server that cannot process
+                                    // the Digest challenge. "Server returned nothing" gives the
+                                    // caller no way to reach that conclusion on their own.
+                                    else if (
+                                        attempted_cleartext_digest &&
+                                        (code == CURLE_GOT_NOTHING || code == CURLE_RECV_ERROR ||
+                                         code == CURLE_SEND_ERROR ||
+                                         code == CURLE_WEIRD_SERVER_REPLY ||
+                                         code == CURLE_PARTIAL_FILE)
+                                    )
+                                    {
+                                        message +=
+                                            " -- the device dropped an authenticated request and "
+                                            "may not support HTTP Digest authentication, which is "
+                                            "all this client offers over cleartext HTTP. Set "
+                                            "Credentials::allow_cleartext_basic to offer the full "
+                                            "authentication set; devices using a WS-Security "
+                                            "UsernameToken send no HTTP challenge, so no password "
+                                            "is transmitted in cleartext.";
+                                        // Repeating an identical request reproduces this exactly,
+                                        // so it is not retryable. Callers also use the cleared
+                                        // flag to tell this apart from a transient network fault.
+                                        retryable = false;
+                                    }
                                     result = Error{category, {}, std::move(message), retryable};
                                 }
-                                rt->post(
+                                detail::dispatch(
+                                    rt,
                                     [done = std::move(done), result = std::move(result)]() mutable
                                     {
                                         done(std::move(result));

@@ -1,4 +1,9 @@
+#include "dispatch.hpp"
+#include "xml_scan.hpp"
+
 #include <algorithm>
+#include <chrono>
+#include <ctime>
 #include <deque>
 #include <map>
 #include <wlonvif/wlonvif.hpp>
@@ -23,28 +28,32 @@ namespace wlonvif
     {
         std::string esc(std::string_view s)
         {
-            std::string o;
-            for (char c : s)
-            {
-                if (c == '&')
-                {
-                    o += "&amp;";
-                }
-                else if (c == '<')
-                {
-                    o += "&lt;";
-                }
-                else
-                {
-                    o += c;
-                }
-            }
-            return o;
+            return detail_xml::escape(s);
         }
         std::string tag(std::string_view n, std::string_view v, std::string_view p = "tds")
         {
             return "<" + std::string(p) + ":" + std::string(n) + ">" + esc(v) + "</" +
                    std::string(p) + ":" + std::string(n) + ">";
+        }
+        /// Serialize the current UTC time the way a Device service reports it.
+        std::string utc_date_and_time()
+        {
+            const auto now = std::chrono::system_clock::to_time_t(
+                std::chrono::system_clock::now()
+            );
+            std::tm utc{};
+#ifdef _WIN32
+            gmtime_s(&utc, &now);
+#else
+            gmtime_r(&now, &utc);
+#endif
+            const auto number = [](int value) { return std::to_string(value); };
+            return "<tt:UTCDateTime><tt:Time>" + tag("Hour", number(utc.tm_hour), "tt") +
+                   tag("Minute", number(utc.tm_min), "tt") +
+                   tag("Second", number(utc.tm_sec), "tt") + "</tt:Time><tt:Date>" +
+                   tag("Year", number(utc.tm_year + 1900), "tt") +
+                   tag("Month", number(utc.tm_mon + 1), "tt") +
+                   tag("Day", number(utc.tm_mday), "tt") + "</tt:Date></tt:UTCDateTime>";
         }
     } // namespace
     VirtualDeviceTransport::VirtualDeviceTransport(
@@ -76,7 +85,8 @@ namespace wlonvif
              services = std::move(services),
              caps = std::move(caps)](auto done) mutable
             {
-                rt->post(
+                detail::dispatch(
+                    rt,
                     [request = std::move(request),
                      token,
                      info = std::move(info),
@@ -103,7 +113,8 @@ namespace wlonvif
                         else if (request.body.find("GetSystemDateAndTime") != request.body.npos)
                         {
                             name = "GetSystemDateAndTime";
-                            body = "<tds:SystemDateAndTime/>";
+                            body = "<tds:SystemDateAndTime>" + utc_date_and_time() +
+                                   "</tds:SystemDateAndTime>";
                         }
                         else if (request.body.find("GetScopes") != request.body.npos)
                         {
@@ -135,6 +146,11 @@ namespace wlonvif
                             {
                                 body += "<tt:PTZ>" + tag("XAddr", *caps.ptz_xaddr) + "</tt:PTZ>";
                             }
+                            if (caps.events_xaddr)
+                            {
+                                body += "<tt:Events>" + tag("XAddr", *caps.events_xaddr) +
+                                        "</tt:Events>";
+                            }
                         }
                         else
                         {
@@ -159,7 +175,12 @@ namespace wlonvif
     {
         std::lock_guard l(service_state_->mutex);
         VirtualServiceState::ProfileState s{
-            p, std::move(stream), std::move(snapshot), spaces, {{0.0, 0.0, 0.0}, false}, {}
+            p,
+            std::move(stream),
+            std::move(snapshot),
+            spaces,
+            {{0.0, 0.0, 0.0}, false, std::nullopt, std::nullopt, true},
+            {}
         };
         service_state_->profiles.insert_or_assign(p.token, std::move(s));
     }
@@ -259,6 +280,28 @@ namespace wlonvif
         apply(i->second.status.position.pan, v.pan);
         apply(i->second.status.position.tilt, v.tilt);
         apply(i->second.status.position.zoom, v.zoom);
+        i->second.status.moving = true;
+        return MoveResult{true, {}};
+    }
+    Result<MoveResult> VirtualDeviceTransport::absolute_move(
+        const ProfileToken& t, PtzVector position, std::optional<PtzVector>
+    )
+    {
+        std::lock_guard l(service_state_->mutex);
+        auto i = service_state_->profiles.find(t);
+        if (i == service_state_->profiles.end())
+        {
+            return Error{
+                ErrorCategory::invalid_argument, OperationId::absolute_move, "unknown profile"
+            };
+        }
+        const auto apply = [](std::optional<double>& destination, std::optional<double> value)
+        {
+            if (value) destination = std::clamp(*value, -1.0, 1.0);
+        };
+        apply(i->second.status.position.pan, position.pan);
+        apply(i->second.status.position.tilt, position.tilt);
+        apply(i->second.status.position.zoom, position.zoom);
         i->second.status.moving = true;
         return MoveResult{true, {}};
     }

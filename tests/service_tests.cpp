@@ -44,15 +44,23 @@ namespace
                                    "</tt:Position><tt:MoveStatus>MOVING</tt:MoveStatus>"
                                    "</tptz:PTZStatus></tptz:GetStatusResponse>";
                     else if (request.body.find("GetConfigurationOptions") != request.body.npos)
+                    {
+                        ++configuration_requests;
                         response = "<tptz:GetConfigurationOptionsResponse><tptz:PTZConfigurationOptions>"
                                    "<tt:Spaces><tt:ContinuousPanTiltVelocitySpace>"
+                                   "<tt:URI>urn:velocity</tt:URI>"
                                    "<tt:XRange><tt:Min>-2</tt:Min><tt:Max>2</tt:Max></tt:XRange>"
                                    "<tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange>"
                                    "</tt:ContinuousPanTiltVelocitySpace>"
                                    "<tt:ContinuousZoomVelocitySpace><tt:XRange>"
                                    "<tt:Min>0</tt:Min><tt:Max>1</tt:Max></tt:XRange>"
-                                   "</tt:ContinuousZoomVelocitySpace></tt:Spaces>"
+                                   "</tt:ContinuousZoomVelocitySpace>"
+                                   "<tt:AbsolutePanTiltPositionSpace><tt:URI>urn:absolute</tt:URI>"
+                                   "<tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange>"
+                                   "<tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange>"
+                                   "</tt:AbsolutePanTiltPositionSpace></tt:Spaces>"
                                    "</tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse>";
+                    }
                     else if (request.body.find("GetPresets") != request.body.npos)
                         response = "<tptz:GetPresetsResponse><tptz:Preset token='home'>"
                                    "<tt:Name>Home</tt:Name><tptz:PTZPosition>"
@@ -62,6 +70,8 @@ namespace
                         response = "<tptz:ContinuousMoveResponse/>";
                     else if (request.body.find("RelativeMove") != request.body.npos)
                         response = "<tptz:RelativeMoveResponse/>";
+                    else if (request.body.find("AbsoluteMove") != request.body.npos)
+                        response = "<tptz:AbsoluteMoveResponse/>";
                     else if (request.body.find("<tptz:Stop") != request.body.npos)
                     {
                         ++stop_requests;
@@ -100,6 +110,7 @@ namespace
             );
         }
         std::atomic_int stop_requests{};
+        std::atomic_int configuration_requests{};
         std::atomic_int unsubscribe_requests{};
     };
 }
@@ -259,12 +270,22 @@ int main()
     VERIFY(network_ptz);
     auto network_status = wait2(network_ptz.value()->status("main", o));
     VERIFY(network_status && network_status.value().moving);
-    VERIFY(std::abs(*network_status.value().position.pan - 0.1) < 1e-12);
+    VERIFY(std::abs(*network_status.value().position.pan - 0.2) < 1e-12);
     auto network_spaces = wait2(network_ptz.value()->spaces("main", o));
     VERIFY(network_spaces && network_spaces.value().pan.minimum == -2);
+    VERIFY(network_spaces.value().continuous_pan_tilt.size() == 1);
+    VERIFY(network_spaces.value().continuous_pan_tilt.front().uri == "urn:velocity");
+    VERIFY(network_spaces.value().absolute_pan_tilt.front().uri == "urn:absolute");
+    VERIFY(network_transport->configuration_requests == 1);
     auto network_presets = wait2(network_ptz.value()->get_presets("main", o));
     VERIFY(network_presets && network_presets.value().size() == 1);
     VERIFY(wait2(network_ptz.value()->relative_move("main", {0.1, {}, {}}, o)));
+    VERIFY(wait2(network_ptz.value()->absolute_move(
+        "main", {0.25, -0.25, {}}, std::optional<PtzVector>{{0.1, {}, {}}}, o
+    )));
+    VERIFY(network_transport->configuration_requests == 1);
+    auto invalid_move = wait2(network_ptz.value()->continuous_move("main", {2.0, {}, {}}, o));
+    VERIFY(!invalid_move && invalid_move.error().category == ErrorCategory::invalid_argument);
     VERIFY(wait2(network_ptz.value()->stop("main", o)));
     VERIFY(network_transport->stop_requests == 1);
 

@@ -26,12 +26,18 @@ namespace wlonvif
         std::size_t nodes = 0, text = 0;
         bool found = false;
         bool fault = false;
+        // Text is collected only between the response element's start and end tags.
+        // Without tracking the depth the response opened at, every later text node
+        // in the document is appended too, so a sibling element after the response
+        // can inject content that reads as though the response produced it.
+        bool collecting = false;
+        int response_depth = -1;
         std::string result;
         int read_status = 0;
         while ((read_status = xmlTextReaderRead(r)) == 1)
         {
-            if (++nodes > limits.nodes ||
-                static_cast<std::size_t>(xmlTextReaderDepth(r)) > limits.depth)
+            const int depth = xmlTextReaderDepth(r);
+            if (++nodes > limits.nodes || static_cast<std::size_t>(depth) > limits.depth)
             {
                 xmlFreeTextReader(r);
                 return Error{ErrorCategory::malformed_xml, {}, "XML structural limit exceeded"};
@@ -45,22 +51,29 @@ namespace wlonvif
                     return Error{ErrorCategory::malformed_xml, {}, "XML attribute limit exceeded"};
                 }
                 auto* local = xmlTextReaderConstLocalName(r);
-                if (local && response_name == reinterpret_cast<const char*>(local))
+                if (local && !found && response_name == reinterpret_cast<const char*>(local))
                 {
                     found = true;
+                    response_depth = depth;
+                    collecting = xmlTextReaderIsEmptyElement(r) != 1;
                 }
                 if (local && std::string_view(reinterpret_cast<const char*>(local)) == "Fault")
                 {
                     fault = true;
                 }
             }
+            if (xmlTextReaderNodeType(r) == XML_READER_TYPE_END_ELEMENT && collecting &&
+                depth == response_depth)
+            {
+                collecting = false;
+            }
             if (xmlTextReaderNodeType(r) == XML_READER_TYPE_DOCUMENT_TYPE)
             {
                 xmlFreeTextReader(r);
                 return Error{ErrorCategory::malformed_xml, {}, "DTD is prohibited"};
             }
-            if (found && (xmlTextReaderNodeType(r) == XML_READER_TYPE_TEXT ||
-                          xmlTextReaderNodeType(r) == XML_READER_TYPE_CDATA))
+            if (collecting && (xmlTextReaderNodeType(r) == XML_READER_TYPE_TEXT ||
+                               xmlTextReaderNodeType(r) == XML_READER_TYPE_CDATA))
             {
                 auto* value = xmlTextReaderConstValue(r);
                 if (value)

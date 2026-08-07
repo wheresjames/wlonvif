@@ -64,8 +64,8 @@
  * Real-device examples also accept `--ip ADDRESS`; shared support performs targeted
  * library discovery to learn the Device service URL and nonstandard port. `--url`
  * remains the mutually exclusive explicit override.
- * PTZ keyboard mode provides WASD/cursor control, coalesces terminal key repeats,
- * infers key release using a configurable movement lease, and provides a latched
- * fallback mode. Its live ASCII position/status panel refreshes after each Stop,
- * and error and exit paths independently attempt Stop.
+ * The PTZ diagnostic example exposes bounded individual operations rather than an
+ * interactive terminal controller. Applications that need natural manual control
+ * should use `PtzController`, which owns input leases, shaping, ramps, command
+ * pacing, zoom-aware scaling, watchdog behavior, and Stop/close safety.
  */

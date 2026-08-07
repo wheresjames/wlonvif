@@ -30,6 +30,7 @@ namespace
         std::cout
             << "Usage: " << executable << " [options]\n\n"
             << "Discovery methods:\n"
+            << "  --discover-all         Multicast and directly inspect eligible local networks\n"
             << "  --target ADDRESS       Unicast-discover and directly inspect one IPv4 address\n"
             << "  --ip ADDRESS           Alias for --target\n"
             << "  --scan CIDR|auto       Directly inspect an explicit or local IPv4 network\n"
@@ -37,13 +38,14 @@ namespace
             << "  --interface ADDRESS    Use one IPv4 address for multicast (repeatable)\n"
             << "  --no-multicast         Disable multicast WS-Discovery\n\n"
             << "Limits and output:\n"
-            << "  --timeout SECONDS      Overall deadline (default: 8)\n"
+            << "  --timeout SECONDS      Overall deadline (default: 8; discover-all: 60)\n"
             << "  --max-hosts COUNT      Maximum expanded scan addresses (default: 1024)\n"
-            << "  --jobs COUNT           Simultaneous direct probes (default: 16)\n"
+            << "  --jobs COUNT           Simultaneous probes (default: 16; discover-all: 32)\n"
             << "  --json                 Emit machine-readable JSON\n"
             << "  --no-progress          Disable progress output on stderr\n"
             << "  --help                 Show this help\n\n"
-            << "Subnet scanning is opt-in. Scan only networks you are authorized to inspect.\n";
+            << "--discover-all scans directly connected networks that fit --max-hosts.\n"
+            << "Scan only networks you are authorized to inspect.\n";
     }
 } // namespace
 
@@ -56,13 +58,11 @@ int main(int argc, char** argv)
         return 2;
     }
     auto common = std::move(parsed.value().common);
-    if (!common.timeout_set)
-    {
-        common.timeout_seconds = 8;
-    }
     const auto& arguments = parsed.value().remaining;
     wlonvif::NetworkDiscoveryOptions options;
     bool auto_networks = false;
+    bool discover_all = false;
+    bool jobs_set = false;
 
     for (std::size_t index = 0; index < arguments.size(); ++index)
     {
@@ -72,7 +72,13 @@ int main(int argc, char** argv)
             usage(argv[0]);
             return 0;
         }
-        if (argument == "--no-multicast")
+        if (argument == "--discover-all")
+        {
+            discover_all = true;
+            auto_networks = true;
+            options.direct_probe = true;
+        }
+        else if (argument == "--no-multicast")
         {
             options.multicast = false;
         }
@@ -126,6 +132,7 @@ int main(int argc, char** argv)
                 std::cerr << "Job count must be between 1 and 256.\n";
                 return 2;
             }
+            jobs_set = true;
         }
         else
         {
@@ -133,6 +140,15 @@ int main(int argc, char** argv)
             usage(argv[0]);
             return 2;
         }
+    }
+
+    if (!common.timeout_set)
+    {
+        common.timeout_seconds = discover_all ? 60 : 8;
+    }
+    if (discover_all && !jobs_set)
+    {
+        options.maximum_concurrency = 32;
     }
 
     if (auto_networks)
@@ -146,7 +162,8 @@ int main(int argc, char** argv)
         options.scan_networks = std::move(networks.value());
         if (!common.json)
         {
-            std::cout << "Scanning authorized local network range(s):";
+            std::cout << (discover_all ? "Discover-all direct-scan coverage:"
+                                      : "Scanning authorized local network range(s):");
             for (const auto& network : options.scan_networks)
             {
                 std::cout << ' ' << network;
