@@ -1,5 +1,11 @@
 include_guard(GLOBAL)
 
+# The version header is generated from PROJECT.txt (via project()) so the
+# library, its package files, and its consumers can never disagree.
+set(WLONVIF_GENERATED_INCLUDE_DIR ${PROJECT_BINARY_DIR}/generated/include)
+configure_file(${PROJECT_SOURCE_DIR}/cmake/version.hpp.in
+  ${WLONVIF_GENERATED_INCLUDE_DIR}/wlonvif/version.hpp @ONLY)
+
 # Dependency-light parsing, runtime, and security primitives.
 add_library(wlonvif_core
   ${PROJECT_SOURCE_DIR}/src/core.cpp
@@ -9,6 +15,7 @@ add_library(wlonvif::core ALIAS wlonvif_core)
 target_compile_features(wlonvif_core PUBLIC cxx_std_20)
 target_include_directories(wlonvif_core PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${WLONVIF_GENERATED_INCLUDE_DIR}>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(wlonvif_core PUBLIC Threads::Threads PRIVATE LibXml2::LibXml2 OpenSSL::Crypto)
 wlonvif_apply_project_options(wlonvif_core)
@@ -18,6 +25,7 @@ set_target_properties(wlonvif_core PROPERTIES EXPORT_NAME core)
 add_library(wlonvif_client
   ${PROJECT_SOURCE_DIR}/src/client.cpp
   ${PROJECT_SOURCE_DIR}/src/curl_transport.cpp
+  ${PROJECT_SOURCE_DIR}/src/device_clock.cpp
   ${PROJECT_SOURCE_DIR}/src/discovery.cpp
   ${PROJECT_SOURCE_DIR}/src/network_services.cpp
   ${PROJECT_SOURCE_DIR}/src/ptz_controller.cpp

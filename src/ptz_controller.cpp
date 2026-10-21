@@ -33,14 +33,21 @@ namespace wlonvif
             return PtzVector{pan, tilt, zoom};
         }
 
+        /**
+         * @brief Run a cold task to completion on the calling thread.
+         *
+         * The promise is shared-owned. A promise on this stack frame could be
+         * destroyed by the returning waiter while the completing thread is still
+         * inside set_value().
+         */
         template <class T> T wait_task(Task<T> task)
         {
-            std::promise<T> promise;
-            auto future = promise.get_future();
+            auto promise = std::make_shared<std::promise<T>>();
+            auto future = promise->get_future();
             std::move(task).start(
-                [&promise](T result)
+                [promise](T result)
                 {
-                    promise.set_value(std::move(result));
+                    promise->set_value(std::move(result));
                 }
             );
             return future.get();
@@ -433,8 +440,16 @@ namespace wlonvif
         impl_->worker_cancel.request_stop();
         impl_->wake.notify_all();
         impl_->status_wake.notify_all();
-        if (impl_->worker.joinable()) impl_->worker.join();
-        if (impl_->status_worker.joinable()) impl_->status_worker.join();
+        // The workers wait on completions delivered by the Runtime thread, so
+        // joining them from that thread would never return. They own Impl, so
+        // detaching lets them finish, including the final Stop, on their own.
+        const bool detach = Runtime::on_worker_thread();
+        for (auto* worker : {&impl_->worker, &impl_->status_worker})
+        {
+            if (!worker->joinable()) continue;
+            if (detach) worker->detach();
+            else worker->join();
+        }
     }
 
     Result<void> PtzController::claim_manual(std::string owner)

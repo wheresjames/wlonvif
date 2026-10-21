@@ -120,7 +120,7 @@ int main()
         Capabilities{}
     );
     device->add_profile(
-        {"main", "Main"},
+        {"main", "Main", {}},
         {"rtsp://camera/main", std::chrono::seconds(60), false},
         {"http://camera/snapshot", std::chrono::seconds(60), false},
         {{-1, 1}, {-1, 1}, {-1, 1}}

@@ -4,25 +4,30 @@
  * @section overview Overview
  *
  * `wlonvif` is a C++20 client library for selected ONVIF Device, Media1, PTZ,
- * PullPoint Event, and discovery workflows. It favors a compact typed API,
+ * Imaging, Analytics, PullPoint Event, and discovery workflows. It favors a compact typed API,
  * explicit resource bounds, deterministic lifecycle behavior, and testability over
  * generated bindings for the complete ONVIF schema family.
  *
  * The library provides:
  *
- * - Device identity, UTC time, scopes, services, and capabilities;
- * - Media1 profile, stream URI, snapshot URI, and bounded download workflows;
- * - normalized PTZ spaces, status, movement, Stop, emergency Stop, and presets;
+ * - Device identity, services, and capabilities; clock, NTP, and scope configuration;
+ * - Media1 profiles and their full configurations, video encoder options and changes,
+ *   stream and snapshot URIs, and bounded downloads;
+ * - normalized PTZ spaces, status, movement, Stop, emergency Stop, presets, preset
+ *   tours, and image orientation;
+ * - Imaging settings within the device's ranges, and Analytics modules and rules;
  * - a stateful manual PTZ controller and calibrated viewport movement mapping;
  * - IPv4 WS-Discovery plus bounded targeted and CIDR direct probing;
  * - PullPoint subscription management, bounded event queues, and continuity health;
- * - challenge-driven HTTP and WS-Security authentication;
+ * - challenge-driven HTTP and WS-Security authentication, with WS-Security
+ *   timestamps corrected for the device's clock offset;
  * - endpoint and resolved-address authorization boundaries;
  * - bounded SOAP/XML parsing and structured errors; and
- * - an in-process virtual Device/Media/PTZ/Event backend for tests.
+ * - DeviceSession::call() for operations without a typed call; and
+ * - an in-process virtual Device/Media/PTZ/Imaging/Analytics/Event backend for tests.
  *
- * This is not a Media2, Imaging, Analytics, Recording, Replay, codec, RTP/RTSP
- * playback, general ONVIF server, or conformance-certification implementation.
+ * This is not a Media2, Recording, Replay, codec, RTP/RTSP playback, general ONVIF
+ * server, or conformance-certification implementation.
  * Cameras differ substantially by model and firmware, so deployments must qualify
  * the exact operations they depend on.
  *
@@ -35,7 +40,7 @@
  *          |
  *      DeviceSession  ---- lifecycle, credentials, child cancellation, PTZ safety
  *       /    |    \
- *  Device  Media1   PTZ / Events
+ *  Device  Media1   PTZ / Imaging / Analytics / Events
  *          |
  * HttpTransport ---- EndpointPolicy ---- optional CandidateAuthorizer
  *          |
@@ -189,6 +194,19 @@
  * - DeviceSession::get_scopes()
  * - DeviceSession::get_services()
  * - DeviceSession::get_capabilities()
+ * - DeviceSession::set_system_date_and_time(), DeviceSession::get_ntp(), and
+ *   DeviceSession::set_ntp()
+ * - DeviceSession::get_scope_entries(), DeviceSession::set_scopes(),
+ *   DeviceSession::add_scopes(), and DeviceSession::remove_scopes()
+ * - DeviceSession::get_hostname(), DeviceSession::get_network_interfaces(),
+ *   DeviceSession::get_dns(), DeviceSession::get_discovery_mode(),
+ *   DeviceSession::get_users(), DeviceSession::system_reboot(), and their setters
+ * - DeviceSession::call() for any other operation
+ *
+ * DeviceSession::imaging() returns ImagingClient for brightness, contrast, and
+ * similar settings; DeviceSession::analytics() returns AnalyticsClient for
+ * detection modules and rules. EventClient::get_topics() lists event topics, and
+ * PullPointSubscriptionOptions::topics filters a subscription on the device.
  *
  * DeviceSession::media() returns MediaClient for Media1 profiles and stream or
  * snapshot URIs. `download_binary()` retrieves authorized bounded opaque content;
@@ -198,7 +216,11 @@
  * velocities use normalized `[-1,+1]` coordinates and retain the device's native
  * advertised space metadata in PtzSpaces. Available operations include continuous,
  * relative, and absolute movement, status, ordinary Stop, urgent emergency Stop,
- * preset enumeration, and preset navigation.
+ * presets (list, go to, save, remove), preset tours (create, modify, start, pause,
+ * stop, remove), and image orientation (EFlip and Reverse).
+ *
+ * A service the device does not advertise is reported as ErrorCategory::unsupported
+ * when its client is used, so applications can hide features a camera lacks.
  *
  * DeviceSession::event_client() returns EventClient. `create_pullpoint()` exposes
  * explicit create, pull, renew, unsubscribe, state, and bounded-close operations on
@@ -289,7 +311,9 @@
  * and platform threads. SDL3, Boost.Beast, and FFmpeg belong only to optional
  * examples and are not dependencies of the installed client libraries.
  *
- * `library_version()` returns the native semantic version. `library_features()`
+ * `library_version()` returns the native semantic version. `PROJECT.txt` is the
+ * single source of version information: CMake reads it for `project()`, the
+ * package version file, and the generated `<wlonvif/version.hpp>` macros. `library_features()`
  * exposes embedding-contract readiness for candidate authorization, credential
  * providers, deterministic close, PTZ safety, PullPoint integration, and streaming
  * discovery. These flags are intended for adapters that must reject an incompatible
@@ -299,9 +323,15 @@
  * @section examples Examples and further guidance
  *
  * Build dependency-light examples with `WLONVIF_BUILD_EXAMPLES=ON`. They cover
- * discovery, Device inspection, inventory, endpoint policy, virtual-device usage,
- * Media URIs and snapshots, PTZ diagnostics, PullPoint monitoring, camera health,
+ * discovery, Device inspection and configuration, inventory, endpoint policy,
+ * virtual-device usage, Media profiles, URIs, snapshots, and encoders, Imaging,
+ * Analytics, raw requests, PTZ diagnostics, PullPoint monitoring, camera health,
  * and bounded multi-camera inspection.
+ *
+ * `WLONVIF_BUILD_EXPLORER=ON` adds `wlonvif-explorer`, a browser application that
+ * scans the network, signs in to a camera, and exposes every feature above, plus a
+ * read-only compatibility check whose report can be attached to a bug report.
+ * Controls for features a camera does not offer are dimmed, with the reason.
  *
  * `WLONVIF_BUILD_PTZ_CONTROL=ON` adds the SDL3 native keyboard/gamepad frontend.
  * `WLONVIF_BUILD_PTZ_WEB=ON` adds the loopback-first Boost.Beast browser frontend.
@@ -314,9 +344,12 @@
  *
  * - `README.md` — build options, all command-line examples, installation, real
  *   device smoke testing, comparisons, and deployment cautions;
- * - `docs/session-security.md` — lifecycle, transport, credential, error, and PTZ
- *   safety contracts;
- * - `docs/ptz-control.md` — SDL mapping, calibration, safety, and qualification; and
- * - `docs/ptz-web.md` — browser protocol, FFmpeg bridge, calibration, remote threat
- *   model, and limitations.
+ * - [Session and transport security](session-security.md) — lifecycle, transport,
+ *   credential, error, and PTZ safety contracts;
+ * - [Native PTZ control](ptz-control.md) — SDL mapping, calibration, safety, and
+ *   qualification; and
+ * - [Browser PTZ control](ptz-web.md) — browser protocol, FFmpeg bridge, calibration,
+ *   remote threat model, and limitations.
+ *
+ * These three guides are included in this documentation as related pages.
  */

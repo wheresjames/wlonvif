@@ -1,4 +1,14 @@
-/** @file main.cpp @brief Discover and inspect multiple real ONVIF devices. */
+/**
+ * @file main.cpp
+ * @brief wlonvif-inventory: find the cameras on a network and tabulate what each is.
+ *
+ *     wlonvif-inventory --scan auto --username admin --media --ptz
+ *
+ * Two phases: discovery (WS-Discovery multicast plus, with --scan or --target,
+ * direct probes of each address), then a pool of --jobs workers that connect to
+ * every camera found and read its identity, plus Media, PTZ, and Events details
+ * when asked. One row per camera; a camera that fails gets its error in its row.
+ */
 
 #include <atomic>
 #include <example_support.hpp>
@@ -33,7 +43,7 @@ namespace
             << "  --timeout SECONDS --username NAME --password PASSWORD --password-file FILE\n"
             << "  --password-env NAME --json --no-progress --help\n";
     }
-}
+} // namespace
 
 int main(int argc, char** argv)
 {
@@ -57,32 +67,51 @@ int main(int argc, char** argv)
             usage(argv[0]);
             return 0;
         }
-        if ((argument == "--target" || argument == "--ip" || argument == "--scan" || argument == "--jobs") &&
+        if ((argument == "--target" || argument == "--ip" || argument == "--scan" ||
+             argument == "--jobs") &&
             index + 1 >= parsed.value().remaining.size())
         {
             std::cerr << "Missing value for " << argument << '\n';
             return 2;
         }
         if (argument == "--target" || argument == "--ip")
+        {
             discovery.targets.push_back(parsed.value().remaining[++index]);
+        }
         else if (argument == "--scan")
         {
             const auto& value = parsed.value().remaining[++index];
             auto_networks = value == "auto";
-            if (!auto_networks) discovery.scan_networks.push_back(value);
+            if (!auto_networks)
+            {
+                discovery.scan_networks.push_back(value);
+            }
         }
         else if (argument == "--jobs")
         {
-            if (!wlonvif::examples::parse_size(parsed.value().remaining[++index], jobs) || jobs > 64)
+            if (!wlonvif::examples::parse_size(parsed.value().remaining[++index], jobs) ||
+                jobs > 64)
             {
                 std::cerr << "Job count must be between 1 and 64\n";
                 return 2;
             }
         }
-        else if (argument == "--no-multicast") discovery.multicast = false;
-        else if (argument == "--media") inspect_media = true;
-        else if (argument == "--ptz") inspect_ptz = true;
-        else if (argument == "--events") inspect_events = true;
+        else if (argument == "--no-multicast")
+        {
+            discovery.multicast = false;
+        }
+        else if (argument == "--media")
+        {
+            inspect_media = true;
+        }
+        else if (argument == "--ptz")
+        {
+            inspect_ptz = true;
+        }
+        else if (argument == "--events")
+        {
+            inspect_events = true;
+        }
         else
         {
             std::cerr << "Unknown argument: " << argument << '\n';
@@ -122,18 +151,24 @@ int main(int argc, char** argv)
             {
                 return;
             }
-            std::cerr << (terminal_progress ? "\r" : "") << "Discovery "
-                      << progress.completed << '/' << progress.total << "  " << progress.current
+            std::cerr << (terminal_progress ? "\r" : "") << "Discovery " << progress.completed
+                      << '/' << progress.total << "  " << progress.current
                       << (terminal_progress ? "\033[K" : "\n") << std::flush;
         };
     }
-    auto found = wlonvif::examples::wait_for_task(wlonvif::discover_devices(
-        runtime,
-        wlonvif::make_same_origin_policy(),
-        std::move(discovery),
-        wlonvif::examples::call_options(common.timeout_seconds)
-    ));
-    if (common.show_progress && terminal_progress) std::cerr << '\n';
+    // ---- Phase 1: discovery ----------------------------------------------------------
+    auto found = wlonvif::examples::wait_for_task(
+        wlonvif::discover_devices(
+            runtime,
+            wlonvif::make_same_origin_policy(),
+            std::move(discovery),
+            wlonvif::examples::call_options(common.timeout_seconds)
+        )
+    );
+    if (common.show_progress && terminal_progress)
+    {
+        std::cerr << '\n';
+    }
     if (!found)
     {
         std::cerr << "Discovery failed: " << found.error().message << '\n';
@@ -141,6 +176,8 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    // ---- Phase 2: query each camera, --jobs at a time ------------------------------------
+    // One preallocated row per camera, written only by the worker that took it.
     std::vector<InventoryItem> items(found.value().size());
     std::atomic_size_t next{};
     std::atomic_size_t completed{};
@@ -156,7 +193,10 @@ int main(int argc, char** argv)
                 for (;;)
                 {
                     const auto index = next.fetch_add(1);
-                    if (index >= found.value().size()) return;
+                    if (index >= found.value().size())
+                    {
+                        return;
+                    }
                     const auto& candidate = found.value()[index];
                     auto& item = items[index];
                     item.address = candidate.address;
@@ -177,7 +217,10 @@ int main(int argc, char** argv)
                             credentials.value(),
                             common.timeout_seconds
                         );
-                        if (!session) item.error = session.error();
+                        if (!session)
+                        {
+                            item.error = session.error();
+                        }
                         else
                         {
                             auto information = wlonvif::examples::wait_for_task(
@@ -185,8 +228,14 @@ int main(int argc, char** argv)
                                     wlonvif::examples::call_options(common.timeout_seconds)
                                 )
                             );
-                            if (information) item.information = std::move(information.value());
-                            else item.error = information.error();
+                            if (information)
+                            {
+                                item.information = std::move(information.value());
+                            }
+                            else
+                            {
+                                item.error = information.error();
+                            }
                             if (!item.error && (inspect_media || inspect_ptz || inspect_events))
                             {
                                 auto capabilities = wlonvif::examples::wait_for_task(
@@ -194,27 +243,47 @@ int main(int argc, char** argv)
                                         wlonvif::examples::call_options(common.timeout_seconds)
                                     )
                                 );
-                                if (!capabilities) item.capability_error = capabilities.error();
+                                if (!capabilities)
+                                {
+                                    item.capability_error = capabilities.error();
+                                }
                                 else
                                 {
                                     if (inspect_ptz)
-                                        item.ptz_advertised = capabilities.value().ptz_xaddr.has_value();
+                                    {
+                                        item.ptz_advertised =
+                                            capabilities.value().ptz_xaddr.has_value();
+                                    }
                                     if (inspect_events)
-                                        item.events_advertised = capabilities.value().events_xaddr.has_value();
+                                    {
+                                        item.events_advertised =
+                                            capabilities.value().events_xaddr.has_value();
+                                    }
                                 }
                                 if (inspect_media)
                                 {
                                     auto media = session.value()->media();
-                                    if (!media) item.capability_error = media.error();
+                                    if (!media)
+                                    {
+                                        item.capability_error = media.error();
+                                    }
                                     else
                                     {
                                         auto profiles = wlonvif::examples::wait_for_task(
                                             media.value()->get_profiles(
-                                                wlonvif::examples::call_options(common.timeout_seconds)
+                                                wlonvif::examples::call_options(
+                                                    common.timeout_seconds
+                                                )
                                             )
                                         );
-                                        if (profiles) item.media_profiles = profiles.value().size();
-                                        else item.capability_error = profiles.error();
+                                        if (profiles)
+                                        {
+                                            item.media_profiles = profiles.value().size();
+                                        }
+                                        else
+                                        {
+                                            item.capability_error = profiles.error();
+                                        }
                                     }
                                 }
                             }
@@ -236,9 +305,15 @@ int main(int argc, char** argv)
         );
     }
     workers.clear();
-    if (common.show_progress && terminal_progress && !items.empty()) std::cerr << '\n';
+    if (common.show_progress && terminal_progress && !items.empty())
+    {
+        std::cerr << '\n';
+    }
 
-    if (common.json) std::cout << '[';
+    if (common.json)
+    {
+        std::cout << '[';
+    }
     std::size_t failures = 0;
     for (std::size_t index = 0; index < items.size(); ++index)
     {
@@ -264,35 +339,64 @@ int main(int argc, char** argv)
                 std::cout << ",\"error\":\""
                           << wlonvif::examples::error_category_name(item.error->category) << '"';
             }
-            if (item.media_profiles) std::cout << ",\"media_profiles\":" << *item.media_profiles;
-            if (item.ptz_advertised) std::cout << ",\"ptz\":"
-                                                << (*item.ptz_advertised ? "true" : "false");
-            if (item.events_advertised) std::cout << ",\"events\":"
-                                                   << (*item.events_advertised ? "true" : "false");
-            if (item.capability_error) std::cout << ",\"capability_error\":\""
-                                                  << wlonvif::examples::error_category_name(
-                                                         item.capability_error->category
-                                                     ) << '"';
+            if (item.media_profiles)
+            {
+                std::cout << ",\"media_profiles\":" << *item.media_profiles;
+            }
+            if (item.ptz_advertised)
+            {
+                std::cout << ",\"ptz\":" << (*item.ptz_advertised ? "true" : "false");
+            }
+            if (item.events_advertised)
+            {
+                std::cout << ",\"events\":" << (*item.events_advertised ? "true" : "false");
+            }
+            if (item.capability_error)
+            {
+                std::cout << ",\"capability_error\":\""
+                          << wlonvif::examples::error_category_name(item.capability_error->category)
+                          << '"';
+            }
             std::cout << '}';
         }
         else
         {
             std::cout << item.address << "  ";
             if (item.information)
+            {
                 std::cout << item.information->manufacturer << ' ' << item.information->model;
-            else std::cout << '[' << wlonvif::examples::error_category_name(item.error->category)
-                           << "] " << item.error->message;
-            if (item.media_profiles) std::cout << "  media_profiles=" << *item.media_profiles;
-            if (item.ptz_advertised) std::cout << "  ptz=" << (*item.ptz_advertised ? "yes" : "no");
+            }
+            else
+            {
+                std::cout << '[' << wlonvif::examples::error_category_name(item.error->category)
+                          << "] " << item.error->message;
+            }
+            if (item.media_profiles)
+            {
+                std::cout << "  media_profiles=" << *item.media_profiles;
+            }
+            if (item.ptz_advertised)
+            {
+                std::cout << "  ptz=" << (*item.ptz_advertised ? "yes" : "no");
+            }
             if (item.events_advertised)
+            {
                 std::cout << "  events=" << (*item.events_advertised ? "yes" : "no");
+            }
             if (item.capability_error)
+            {
                 std::cout << "  capability="
-                          << wlonvif::examples::error_category_name(item.capability_error->category);
+                          << wlonvif::examples::error_category_name(
+                                 item.capability_error->category
+                             );
+            }
             std::cout << '\n';
         }
     }
-    if (common.json) std::cout << "]\n";
+    if (common.json)
+    {
+        std::cout << "]\n";
+    }
     (void)runtime->shutdown();
     return failures == items.size() && !items.empty() ? 1 : 0;
 }

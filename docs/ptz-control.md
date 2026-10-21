@@ -30,7 +30,7 @@ Camera operation requires an explicit endpoint, profile, and movement confirmati
 
 ```sh
 ./build-native/examples/ptz-control/wlonvif-ptz-control \
-  --ip 192.168.10.34 --profile profile_1 \
+  --ip 192.0.2.10 --profile profile_1 \
   --username USER --password-file CAMERA_PASSWORD \
   --confirm-movement
 ```

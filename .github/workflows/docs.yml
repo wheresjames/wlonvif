@@ -1,0 +1,69 @@
+name: Docs
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Only the latest push publishes; an in-progress deployment is allowed to finish.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  # Pinned to the version the docs are written against: the Doxyfile fails on
+  # warnings, and Ubuntu's packaged Doxygen is older and warns differently.
+  DOXYGEN_VERSION: "1.15.0"
+
+jobs:
+  # Pull requests only build, so documentation warnings fail the check.
+  build:
+    name: build docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build graphviz libcurl4-openssl-dev libxml2-dev libssl-dev
+      - name: Install Doxygen
+        run: |
+          tag="Release_${DOXYGEN_VERSION//./_}"
+          curl -fsSL -o doxygen.tar.gz \
+            "https://github.com/doxygen/doxygen/releases/download/${tag}/doxygen-${DOXYGEN_VERSION}.linux.bin.tar.gz"
+          mkdir -p "$RUNNER_TEMP/doxygen"
+          tar -xzf doxygen.tar.gz -C "$RUNNER_TEMP/doxygen" --strip-components=1
+          rm doxygen.tar.gz
+          echo "$RUNNER_TEMP/doxygen/bin" >> "$GITHUB_PATH"
+      - name: Configure
+        run: >
+          cmake -S . -B build-docs -G Ninja
+          -DWLONVIF_BUILD_TESTING=OFF
+          -DWLONVIF_BUILD_EXAMPLES=OFF
+          -DWLONVIF_BUILD_DOCS=ON
+      - name: Build
+        run: cmake --build build-docs --target wlonvif_docs
+      - name: Upload site
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build-docs/docs/html
+
+  # Requires Settings > Pages > Source set to "GitHub Actions".
+  deploy:
+    name: publish to GitHub Pages
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

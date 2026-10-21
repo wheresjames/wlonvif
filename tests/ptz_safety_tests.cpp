@@ -38,7 +38,7 @@ namespace
         spaces.pan = spaces.tilt = spaces.zoom = {-1, 1};
         for (const auto* token : {"main", "aux"})
         {
-            MediaProfile profile{token, token};
+            MediaProfile profile{token, token, {}};
             device->add_profile(profile, {}, {}, spaces);
             device->add_preset(token, Preset{"home", "Home", {0.0, 0.0, 0.0}});
         }

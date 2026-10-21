@@ -4,10 +4,17 @@
 devices. It includes a network client, a deterministic virtual-device backend, and
 command-line examples for common camera workflows.
 
-The project currently supports Device operations, Media1 profiles and URIs,
-normalized PTZ control, WS-Discovery and direct network probing, PullPoint events,
+The project currently supports Device operations and configuration, Media1
+profiles, encoders, and URIs, normalized PTZ control with presets and tours, Imaging
+and Analytics settings, WS-Discovery and direct network probing, PullPoint events,
 bounded SOAP/XML processing, endpoint authorization, and authenticated HTTP
-transport.
+transport. A browser-based explorer lets you try all of it on a camera and produce
+a compatibility report.
+
+[![CI](https://github.com/wheresjames/wlonvif/actions/workflows/ci.yml/badge.svg)](https://github.com/wheresjames/wlonvif/actions/workflows/ci.yml)
+[![Docs](https://github.com/wheresjames/wlonvif/actions/workflows/docs.yml/badge.svg)](https://wheresjames.github.io/wlonvif/)
+
+**API reference:** <https://wheresjames.github.io/wlonvif/>
 
 ## Table of contents
 
@@ -27,8 +34,13 @@ transport.
   - [Credentials](#credentials)
   - [Common options](#common-options)
 - [Examples](#examples)
+  - [Explore a camera in the browser](#explore-a-camera-in-the-browser)
   - [Discover devices](#discover-devices)
   - [Read device information](#read-device-information)
+  - [Configure clock and scopes](#configure-clock-and-scopes)
+  - [Adjust imaging](#adjust-imaging)
+  - [Configure analytics](#configure-analytics)
+  - [Send any ONVIF request](#send-any-onvif-request)
   - [Build a camera inventory](#build-a-camera-inventory)
   - [Inspect endpoint policy](#inspect-endpoint-policy)
   - [Use the virtual device](#use-the-virtual-device)
@@ -37,6 +49,7 @@ transport.
   - [Monitor events](#monitor-events)
   - [Check camera health](#check-camera-health)
   - [Inspect multiple cameras](#inspect-multiple-cameras)
+  - [Example source layout](#example-source-layout)
 - [Real-device smoke testing](#real-device-smoke-testing)
 - [API documentation](#api-documentation)
 - [Focused documentation](#focused-documentation)
@@ -52,7 +65,10 @@ transport.
 ## Highlights
 
 - Modern C++20 API with cold asynchronous tasks and explicit cancellation/deadlines.
-- Device, Media1, PTZ, PullPoint Event, and WS-Discovery support.
+- Device, Media1, PTZ, Imaging, Analytics, PullPoint Event, and WS-Discovery support.
+- WS-Security signatures stamped in the camera's own time, so a camera with a wrong
+  clock still accepts sign-in.
+- A browser explorer and compatibility checker, plus focused command-line examples.
 - Robust discovery using multicast, targeted unicast, and bounded direct probing.
 - HTTP and WS-Security authentication support without logging secrets.
 - Endpoint policies that prevent devices from redirecting clients to unauthorized
@@ -62,6 +78,9 @@ transport.
 - Static/shared builds, sanitizers, fuzzing support, Doxygen, install packages, and
   standalone consumer verification.
 
+The [Examples](#examples) section shows each program; [Example source
+layout](#example-source-layout) explains how the example code is organized.
+
 ## Supported scope
 
 `wlonvif` deliberately provides a curated application-facing API rather than a
@@ -69,17 +88,19 @@ generated binding for every ONVIF schema. The current surface is:
 
 | Area | Supported operations and behavior |
 |---|---|
-| Device | Device information, system UTC time, scopes, services, and capabilities. |
-| Media1 | Profile enumeration, stream URI retrieval, snapshot URI retrieval, and bounded snapshot download. |
-| PTZ | Advertised spaces, normalized status, continuous/relative/absolute movement, Stop, emergency Stop, presets, and preset navigation. |
+| Device | Device information, services, and capabilities; clock read and write (manual time, NTP mode, time zone, daylight saving) and NTP servers; scopes with fixed/configurable definitions, plus set, add, and remove; hostname, network interfaces, DNS, gateway, protocols, discovery mode, accounts, and reboot; any other operation through `DeviceSession::call()`. |
+| Media1 | Profile enumeration, full profile configurations (video source, video and audio encoders, PTZ and analytics tokens), video sources, video encoder options and changes, stream URI retrieval, snapshot URI retrieval, and bounded snapshot download. |
+| PTZ | Advertised spaces, normalized status, continuous/relative/absolute movement, Stop, emergency Stop, presets (list, go to, save, remove), preset tours (create, modify, start, pause, stop, remove), and image orientation (EFlip, Reverse). |
+| Imaging | Brightness, contrast, saturation, sharpness, IR-cut filter, backlight compensation, wide dynamic range, and white-balance modes, with the device's accepted ranges. |
+| Analytics | Analytics modules (such as motion and tamper detection) and rules: read parameters and change them, keeping structured parameters intact. |
 | Stateful PTZ | Input ownership, latest-intent coalescing, shaping, ramps, pacing, watchdog and maximum-run safety, soft limits, keep-out zones, zoom-speed curves, telemetry, and bounded close. |
 | Viewport movement | Validated click-to-center and box-zoom mapping with crop, rotation, mirroring, directional gains, calibration age, and zoom interpolation. |
-| Events | Explicit PullPoint create/pull/renew/unsubscribe handles plus automatic bounded polling, renewal, reconnect, backoff, and continuity-health reporting. |
+| Events | Topic discovery, device-side topic filters, explicit PullPoint create/pull/renew/unsubscribe handles plus automatic bounded polling, renewal, reconnect, backoff, and continuity-health reporting. |
 | Discovery | IPv4 WS-Discovery multicast and targeted unicast, common-path direct probing, per-action host authorization, authorized CIDR expansion, evidence merging, duplicate suppression, progress, and concurrency/result bounds. |
-| Security | WS-Security UsernameToken digest, challenge-driven HTTP authentication, HTTPS verification, credential providers and leases, endpoint policy, DNS-candidate authorization, response/XML limits, and structured failures. |
+| Security | WS-Security UsernameToken digest stamped in measured device time (tolerates skewed camera clocks), challenge-driven HTTP authentication, HTTPS verification, credential providers and leases, endpoint policy, DNS-candidate authorization, response/XML limits, and structured failures. |
 | Testing | Deterministic virtual Device/Media/PTZ/Event behavior without sockets or camera hardware. |
 
-Not currently provided are Media2, Imaging, Analytics, Recording, Replay, RTP/RTSP
+Not currently provided are Media2, Recording, Replay, RTP/RTSP
 playback, codecs, a general ONVIF network server, push-event notification hosting,
 or formal ONVIF conformance certification. Service availability also depends on the
 camera profile and firmware; an advertised endpoint is not proof that every device
@@ -100,10 +121,11 @@ Doxygen and Graphviz `dot` are additionally required when
 `WLONVIF_BUILD_DOCS=ON`. LibFuzzer targets require Clang.
 
 VLC, mpv, and FFmpeg are not library dependencies. The media example prints
-commands for external players, while the optional browser PTZ example can launch an
-installed FFmpeg at runtime for its simple MJPEG bridge. Snapshot download is
-implemented by the library and needs no image codec. SDL3 is required only by the
-native PTZ example; Boost 1.89 with JSON is required only by the browser example.
+commands for external players, while the browser examples (the explorer and the
+browser PTZ example) can launch an installed FFmpeg (5.1 or later) at runtime for
+live video and recording. Snapshot download is implemented by the library and needs
+no image codec. SDL3 is required only by the native PTZ example; Boost 1.89 with
+JSON is required only by the browser examples.
 
 ## Quick start
 
@@ -126,8 +148,7 @@ If you already know a camera address, targeted discovery is usually faster and m
 reliable than multicast:
 
 ```sh
-./build/examples/discover/wlonvif-discover \
-  --target CAMERA_IP --thorough --timeout 15
+./build/examples/discover/wlonvif-discover --target CAMERA_IP
 ```
 
 Read its identity and service information:
@@ -159,6 +180,7 @@ Important CMake options are:
 | `WLONVIF_BUILD_EXAMPLES` | `OFF` | Build the dependency-light command-line examples. |
 | `WLONVIF_BUILD_PTZ_CONTROL` | `OFF` | Build the optional SDL3 native keyboard/gamepad PTZ example. |
 | `WLONVIF_BUILD_PTZ_WEB` | `OFF` | Build the optional Boost.Beast browser PTZ example. |
+| `WLONVIF_BUILD_EXPLORER` | `OFF` | Build the optional Boost.Beast browser camera explorer. |
 | `WLONVIF_BUILD_PTZ_DEPENDENCY_SPIKES` | `OFF` | Build the SDL3 and Beast acceptance probes. |
 | `WLONVIF_FETCH_PTZ_DEPENDENCIES` | `OFF` | Fetch the pinned SDL3 release instead of requiring a system package. |
 | `WLONVIF_BUILD_DOCS` | `OFF` | Generate the Doxygen HTML reference. |
@@ -188,7 +210,12 @@ sanitizer, install, consumer, and fuzz-smoke matrix:
 ./scripts/test-all.sh
 ```
 
-The regular test suite is deterministic and does not contact real cameras.
+The regular test suite is deterministic and does not contact real cameras. Besides
+the virtual device, it replays replies recorded from a real camera with gSOAP
+firmware (`tests/fixtures/recorded-camera`), so decoders also meet the prefixes and
+quirks of real firmware. Identifying values in those recordings were replaced with
+documentation values: addresses from `192.0.2.0/24` (RFC 5737) and a MAC address
+from the RFC 7042 documentation block.
 LeakSanitizer is disabled by the script because it cannot operate in some managed or
 ptraced environments. Enable it in an unrestricted runner with:
 
@@ -450,10 +477,60 @@ Most real-device examples support:
 
 The dependency-light examples are enabled by `WLONVIF_BUILD_EXAMPLES=ON` and are
 placed under `build/examples/<name>/`. Native and browser PTZ frontends additionally
-require `WLONVIF_BUILD_PTZ_CONTROL=ON` and `WLONVIF_BUILD_PTZ_WEB=ON`, respectively;
-`WLONVIF_BUILD_EVERYTHING=ON` enables both. Examples are intentionally focused
+require `WLONVIF_BUILD_PTZ_CONTROL=ON` and `WLONVIF_BUILD_PTZ_WEB=ON`, respectively,
+and the browser camera explorer requires `WLONVIF_BUILD_EXPLORER=ON`;
+`WLONVIF_BUILD_EVERYTHING=ON` enables all three. Examples are intentionally focused
 applications that demonstrate library behavior rather than production
 camera-management tools.
+
+### Explore a camera in the browser
+
+`wlonvif-explorer` is the quickest way to find out how well wlonvif works with a
+camera. It serves a browser UI that scans the network, lists the cameras it finds,
+and lets you sign in to one and try everything the library offers:
+
+| Tab | What it does |
+|---|---|
+| Overview | Identity, clock and its offset from this computer, service endpoints, advertised services (and which ones wlonvif supports), scopes. |
+| Compatibility | Runs every read-only operation and reports pass, unsupported, or fail with timings; download the report as JSON or copy a Markdown summary for a bug report. |
+| Live & recording | Live video (through FFmpeg), snapshots (ONVIF snapshot URI, or a frame from the stream when the camera has none), and recording clips to files on the explorer host. |
+| Media | Profiles with their sources and encoders; change resolution, quality, frame rate, bitrate, and GOP within the encoder's options. |
+| PTZ | Hold-to-move pad with live video, presets, preset tours, and image orientation. *Direct* movement (default) sends one command per press and Stop on release; *smooth* ramps and refreshes the speed, which some cameras answer with motor noise. |
+| Imaging | Brightness, contrast, saturation, sharpness, and mode settings within the camera's ranges. |
+| Analytics | Motion and tamper detection modules and rules, editable parameter by parameter. |
+| Events | Event topics, device-side topic filters, and a live event log. |
+| Device | Clock and NTP, hostname, network, discoverability, accounts, scopes, and reboot. |
+| Raw request | Send any ONVIF operation, signed, to any advertised service. |
+
+Every failure shows the error category, the ONVIF operation, the camera's HTTP
+status and SOAP Fault codes, and a plain-language hint; the request log keeps every
+exchange. Features the camera does not offer are dimmed rather than failing: tabs for
+services it does not advertise, PTZ controls outside its movement spaces (zoom on a
+pan/tilt-only camera, for example), encoder values it fixes, and imaging settings it
+lacks. Hovering a dimmed control gives the reason.
+
+```sh
+cmake -S . -B build -DWLONVIF_BUILD_EXAMPLES=ON -DWLONVIF_BUILD_EXPLORER=ON
+cmake --build build --target wlonvif-explorer
+./build/examples/explorer/wlonvif-explorer --scan
+# then open http://127.0.0.1:8090/
+```
+
+`--demo` adds a simulated camera (with an FFmpeg test pattern as video), so the
+explorer can be tried without hardware. `--ip ADDRESS` adds cameras at startup and
+`--username`/`--password` set default credentials. FFmpeg is found on `PATH`
+(`--ffmpeg PATH` or `--no-ffmpeg` to override); recordings go to
+`./wlonvif-recordings` (`--recordings DIR`). ONVIF Profile G on-camera recording is
+not part of wlonvif, so recording is done by FFmpeg on the explorer host.
+Live video starts on the camera's smallest profile, which reaches the browser with
+the least delay; choose a larger one in the profile list. The bridge decodes
+without input buffering and sends only the newest frames to a slow client.
+
+Like the browser PTZ example, the explorer serves loopback only unless TLS and
+`--allow-remote` are both given. Because its API holds camera credentials, it also
+requires its session cookie, refuses cross-origin changes, and accepts only known
+`Host` headers (`--allow-host` adds one), which stops other web pages and DNS
+rebinding from using it. Passwords are kept in memory and never returned by the API.
 
 ### Discover devices
 
@@ -464,26 +541,37 @@ Basic multicast discovery sends current, legacy, and unfiltered WS-Discovery pro
 on each eligible IPv4 interface:
 
 ```sh
-./build/examples/discover/wlonvif-discover --timeout 8
+./build/examples/discover/wlonvif-discover
 ```
 
-When camera addresses are unknown, use the high-coverage local discovery preset.
-It combines multicast on every eligible interface with direct inspection and
-Device-service verification across eligible directly connected networks:
+When camera addresses are unknown, or multicast finds nothing, scan the directly
+connected networks. Every address is sent a unicast WS-Discovery probe and then
+inspected directly on the common Device service ports, so cameras are found even
+where multicast is filtered or ignored:
 
 ```sh
-./build/examples/discover/wlonvif-discover --discover-all
+./build/examples/discover/wlonvif-discover --scan auto
 ```
 
-`--discover-all` defaults to a 60-second overall deadline and 32 simultaneous
-direct probes. It prints the directly scanned CIDRs before starting. Networks
-larger than the `--max-hosts` safety bound (1024 by default) are not scanned;
-specify a larger authorized bound or an explicit CIDR when appropriate:
+`--discover-all` is the same scan with 32 simultaneous probes instead of 16. Both
+print the scanned CIDRs before starting. Networks larger than the `--max-hosts`
+safety bound (1024 by default) are not scanned; specify a larger authorized bound
+or an explicit CIDR when appropriate:
 
 ```sh
 ./build/examples/discover/wlonvif-discover \
-  --discover-all --max-hosts 65536 --timeout 180 --jobs 64
+  --discover-all --max-hosts 65536 --jobs 64
 ```
+
+`--timeout SECONDS` is the time allowed to probe each address (default 2). An
+address's ports are probed concurrently, so an address with nothing behind it costs
+one connect timeout rather than one per port. `--max-time SECONDS` caps the whole
+run; by default it is long enough to probe every address even if each one takes
+the full `--timeout`, so a scan normally covers its entire range. If a shorter
+`--max-time` stops the scan early, the addresses that were not checked, or were
+only partly checked, are listed as ranges and the exit status is 3. Library callers
+get the same information from `discover_network()` and can size a deadline with
+`discovery_time_bound()`.
 
 No local discovery mode can inspect unknown routed VLANs or networks hidden by
 firewall policy. Add those authorized networks explicitly with `--scan CIDR`.
@@ -491,27 +579,24 @@ firewall policy. Add those authorized networks explicitly with `--scan CIDR`.
 Inspect a known address using unicast discovery and common Device service paths:
 
 ```sh
-./build/examples/discover/wlonvif-discover \
-  --target CAMERA_IP --thorough --timeout 15
+./build/examples/discover/wlonvif-discover --target CAMERA_IP
 ```
 
 Scan an authorized subnet, or automatically scan directly connected networks that
 fit the host limit:
 
 ```sh
-./build/examples/discover/wlonvif-discover \
-  --scan CAMERA_CIDR --thorough --timeout 30 --jobs 32
+./build/examples/discover/wlonvif-discover --scan CAMERA_CIDR --jobs 32
 
-./build/examples/discover/wlonvif-discover \
-  --scan auto --max-hosts 1024 --timeout 30
+./build/examples/discover/wlonvif-discover --scan auto --max-hosts 1024
 ```
 
 Useful options include `--interface ADDRESS` (repeatable), `--no-multicast`,
 `--max-hosts COUNT`, `--jobs COUNT`, `--json`, and `--no-progress`. Scanning is
 bounded and opt-in. Only scan addresses you are authorized to inspect.
 
-If multicast finds nothing, check host and network firewall rules for UDP port 3702,
-then use `--target` or `--scan`. Targeted discovery also handles cameras whose
+If multicast finds nothing, a local firewall may be dropping the WS-Discovery
+replies; the tool says so and suggests `--scan auto` or `--target`. Targeted discovery also handles cameras whose
 ONVIF service runs on a nonstandard HTTP port.
 
 ### Read device information
@@ -527,6 +612,101 @@ ONVIF service runs on a nonstandard HTTP port.
 Select individual sections with `--identity`, `--clock`, `--scopes`, `--services`,
 and `--capabilities`. With no section option, all sections are shown. Add `--json`
 for structured output.
+
+### Configure clock and scopes
+
+`wlonvif-device-config` shows and changes a camera's clock, NTP servers, and
+scopes. Changes need administrator credentials. With no change options it prints
+the current configuration, including how far the camera clock is from this
+computer's:
+
+```sh
+./build/examples/device-config/wlonvif-device-config \
+  --ip CAMERA_IP --username CAMERA_USER
+```
+
+Set the camera clock to this computer's time, or hand it to NTP:
+
+```sh
+./build/examples/device-config/wlonvif-device-config --ip CAMERA_IP --sync-time
+./build/examples/device-config/wlonvif-device-config --ip CAMERA_IP --ntp-dhcp
+./build/examples/device-config/wlonvif-device-config \
+  --ip CAMERA_IP --ntp-server 192.0.2.1 --time-zone CET-1CEST,M3.5.0,M10.5.0/3 --dst on
+```
+
+`--location TEXT` replaces the camera's configurable location scope, which
+discovery reports as the device location. `--add-scope URI` and `--remove-scope URI`
+change other scopes. Scopes built into the device are *fixed* and cannot be
+changed or removed; a camera whose own location is fixed then reports both
+locations. Each change is reported as `ok` or `failed` with the device's reason,
+and the configuration is shown again afterwards.
+
+Cameras vary in what they keep. Some store only one NTP server, or only IP
+addresses, while still acknowledging the request, so the tool reads the servers
+back and notes any difference.
+
+The tool also shows the hostname, network interfaces, gateway, DNS, enabled
+services (HTTP, RTSP), WS-Discovery visibility, and device accounts. `--hostname
+NAME` and `--discoverable on|off` change them; a device that briefly restarts its
+network to apply a new hostname is waited for. `--reboot --confirm-reboot` restarts
+the device after any other changes are applied. Some cameras forget added scopes
+across a reboot.
+
+The same operations are available on `DeviceSession`: `set_system_date_and_time()`,
+`get_ntp()`, `set_ntp()`, `get_scope_entries()`, `set_scopes()`, `add_scopes()`,
+`remove_scopes()`, `get_hostname()`, `set_hostname()`, `get_network_interfaces()`,
+`get_dns()`, `get_network_default_gateway()`, `get_network_protocols()`,
+`get_discovery_mode()`, `set_discovery_mode()`, `get_users()`, and
+`system_reboot()`. After a successful clock change the session re-measures the
+device clock before its next signed request.
+
+### Adjust imaging
+
+`wlonvif-imaging` shows each video source's imaging settings next to the ranges the
+device accepts, and changes them:
+
+```sh
+./build/examples/imaging/wlonvif-imaging --ip CAMERA_IP --username CAMERA_USER
+./build/examples/imaging/wlonvif-imaging --ip CAMERA_IP --brightness 60 --contrast 55
+```
+
+Values are checked against the device's ranges and modes before anything is sent
+(`--ir-cut`, `--backlight`, `--wdr`, `--white-balance`, `--sharpness`,
+`--saturation`); only the given settings change. Changes persist across reboots
+unless `--no-persist` is given. In code, use `DeviceSession::imaging()` with a video
+source token from `MediaClient::get_video_sources()`.
+
+### Configure analytics
+
+`wlonvif-analytics` lists the analytics modules and rules behind each profile, such
+as motion and tamper detection, with their parameters:
+
+```sh
+./build/examples/analytics/wlonvif-analytics --ip CAMERA_IP --username CAMERA_USER
+./build/examples/analytics/wlonvif-analytics --ip CAMERA_IP \
+  --module MyCellMotionModule --set Sensitivity=80
+```
+
+`--module NAME` or `--rule NAME` selects what the following `--set NAME=VALUE`
+options change; unknown names are reported with the available ones. Only the
+selected module or rule is sent, and structured parameters such as a motion cell
+layout go back exactly as the device reported them. In code, use
+`DeviceSession::analytics()` with `MediaProfile::video_analytics_configuration`.
+
+### Send any ONVIF request
+
+Operations without a dedicated method can be sent with `wlonvif-call`, which signs
+the request, sends it to the endpoint the device advertises for the chosen service,
+and prints the response:
+
+```sh
+./build/examples/call/wlonvif-call --ip CAMERA_IP '<tds:GetZeroConfiguration/>'
+./build/examples/call/wlonvif-call --ip CAMERA_IP --service media '<trt:GetAudioOutputs/>'
+```
+
+SOAP Faults are printed with their codes, such as `ter:ActionNotSupported`.
+`DeviceSession::call()` offers the same in code; it applies the session's endpoint
+policy, credentials, and clock correction like every other request.
 
 ### Build a camera inventory
 
@@ -635,6 +815,19 @@ Snapshot download requires no codec. It verifies an image content type, writes a
 temporary `.part` file, and renames it only after a complete response. Existing
 output files are never overwritten.
 
+Show each profile's video source, encoders, and PTZ and analytics configuration,
+together with what each video encoder accepts, then change an encoder:
+
+```sh
+./build/examples/media/wlonvif-media --ip CAMERA_IP encoders --username CAMERA_USER
+./build/examples/media/wlonvif-media --ip CAMERA_IP set-encoder --encoder minor \
+  --resolution 640x360 --username CAMERA_USER
+```
+
+`set-encoder` also takes `--quality`, `--fps`, `--interval`, `--bitrate` (kbit/s),
+and `--gov`, checks them against the encoder's options, and reports values the
+device acknowledged but kept unchanged; some cameras fix quality and bitrate.
+
 ### Inspect and control PTZ
 
 PTZ commands require a Media profile token. Start with read-only operations:
@@ -681,6 +874,25 @@ Move to an absolute position or preset:
   --username CAMERA_USER --allow-cleartext-basic --confirm-movement
 ```
 
+Save the current position as a preset, build a tour from presets, and run it:
+
+```sh
+P="./build/examples/ptz/wlonvif-ptz --ip CAMERA_IP --profile profile_1"
+$P save-preset --name Door
+$P create-tour --name Patrol --spot 1:10 --spot 2:20
+$P start-tour --tour 1 --confirm-movement
+$P stop-tour --tour 1
+```
+
+A started tour moves the camera by itself and keeps running after the tool exits,
+until it is stopped. `tours`, `pause-tour`, `remove-tour`, and `remove-preset`
+complete the set. Devices may substitute their own stay times; the tool reports it.
+
+`config` shows the PTZ configuration and image orientation; `set-direction --eflip
+ON` turns the image upside down for ceiling mounting and `--reverse ON` inverts the
+pan/tilt directions. Only the orientation changes; the rest of the configuration is
+sent back as the device reported it.
+
 The diagnostic CLI intentionally has no interactive terminal mode: portable terminal
 input cannot report reliable key release. Applications should use `PtzController`,
 which provides latest-intent coalescing, acceleration/deceleration ramps, response
@@ -710,7 +922,8 @@ spaces, permits safe live profile selection, and dims controls unsupported by th
 active profile. Click direction can be reversed in the UI for nonconforming or
 mirrored cameras. Versioned calibration JSON supports independent left/right/up/down
 gains and optional interpolation across normalized zoom samples.
-Load that configuration with `--viewport-calibration FILE`.
+Load that configuration with `--viewport-calibration FILE`. The page itself is
+`examples/ptz-web/web/index.html`, embedded into the executable at build time.
 
 Build and run it with automatic profile selection and ONVIF stream discovery:
 
@@ -745,7 +958,18 @@ remote use should be placed behind an authenticating proxy. See
   --username CAMERA_USER --allow-cleartext-basic
 ```
 
-Omit `--count` to continue until Ctrl-C. `--topic TEXT` filters topic names. Event
+List the topics the camera can emit, and ask it for only the ones you want:
+
+```sh
+./build/examples/event-monitor/wlonvif-event-monitor --ip CAMERA_IP --topics
+./build/examples/event-monitor/wlonvif-event-monitor --ip CAMERA_IP \
+  --subscribe tns1:RuleEngine/CellMotionDetector/Motion
+```
+
+`--subscribe` is repeatable and filtered by the device; `ManagedEventOptions::topics`
+and `PullPointSubscriptionOptions::topics` do the same in code and survive reconnects.
+
+Omit `--count` to continue until Ctrl-C. `--topic TEXT` filters topic names locally. Event
 JSON is emitted as one object per line when `--json` is enabled, while progress and
 diagnostics remain on stderr. The managed stream has a bounded queue and reports
 health/reconnection signals separately from device events. Its worker renews before
@@ -804,6 +1028,27 @@ Repeat `--ip` and `--url` as needed. A failed or slow camera is represented by i
 own result row and does not remove successful results from other devices. The same
 credentials are currently used for every supplied device.
 
+### Example source layout
+
+The examples share code under `examples/common/`:
+
+| Path | Contents |
+|---|---|
+| `common/example_support.hpp` | Helpers every command-line example uses: `command_line.cpp` (common options and credentials), `connection.cpp` (connecting, deadlines, Ctrl-C), `text.cpp` (JSON, shell quoting, URLs). |
+| `common/web/` | The small Boost.Beast HTTP/WebSocket/TLS server and the FFmpeg MJPEG bridge used by both browser examples. |
+| `common/web_assets.cmake` | Embeds every `.html`, `.js`, and `.css` file under an example's `web/` folder into its executable. |
+
+The explorer is split by API area: `cameras.cpp`, `compatibility_check.cpp`,
+`media_api.cpp`, `ptz_api.cpp`, `events_api.cpp`, `device_api.cpp`,
+`video_api.cpp`, and `router.cpp`, with the shared state described in
+`implementation.hpp`. Its page is plain ES modules under `explorer/web/js/`: one
+module per tab in `tabs/`, plus the page shell, tab bar, request log, and helpers.
+Every web file is served at its path, so adding a module needs no C++ change.
+
+C++ follows the repository's `.clang-format`; the web files follow the
+`.prettierrc.json` next to them. Each example source file starts with a short
+description of what it demonstrates and how to run it.
+
 ## Real-device smoke testing
 
 The opt-in hardware smoke script performs read-only Device and health checks:
@@ -828,7 +1073,12 @@ Optional checks are enabled with:
 
 ## API documentation
 
-Generate the Doxygen HTML reference with:
+The reference for the latest `master` is published at
+<https://wheresjames.github.io/wlonvif/>. The [Docs workflow](.github/workflows/docs.yml)
+rebuilds it on every push to `master` and checks that pull requests build without
+documentation warnings.
+
+Generate the Doxygen HTML reference locally with:
 
 ```sh
 cmake -S . -B build-docs -DWLONVIF_BUILD_DOCS=ON
@@ -850,8 +1100,9 @@ documentation directory.
   safety behavior, and real-device qualification.
 - [Browser PTZ control](docs/ptz-web.md) covers the Beast server, WebSocket protocol,
   FFmpeg bridge, viewport calibration, remote threat model, and orderly shutdown.
-- The generated Doxygen main page is the API-oriented starting point; this README is
-  the build, example, deployment, and project-overview guide.
+- The generated Doxygen main page is the API-oriented starting point and includes
+  the three guides above as related pages; this README is the build, example,
+  deployment, and project-overview guide.
 
 ## Installing and consuming wlonvif
 

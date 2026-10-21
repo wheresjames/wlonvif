@@ -40,19 +40,75 @@ namespace wlonvif
         error.safety_action = detail;
     }
 
-    SafetyActionDetail PtzSafetyState::stop_locked(
+    PtzSafetyState::Admission PtzSafetyState::admit(
+        const ProfileToken& profile, OperationId operation, const std::string& what,
+        CallOptions options
+    )
+    {
+        std::lock_guard lock(mutex_);
+        const bool cancelled = closing_ || cancellation_.stop_requested() ||
+                               options.cancellation.stop_requested();
+        if (cancelled || std::chrono::steady_clock::now() >= options.deadline)
+        {
+            return {Error{cancelled ? ErrorCategory::cancelled : ErrorCategory::timeout,
+                          operation, what + (cancelled ? " cancelled" : " timed out"),
+                          false, true},
+                    0};
+        }
+        ++in_flight_;
+        return {std::nullopt, stops_started_[profile]};
+    }
+
+    bool PtzSafetyState::record(
+        const ProfileToken& profile, OperationId operation, bool finite, std::uint64_t stops_seen
+    )
+    {
+        std::lock_guard lock(mutex_);
+        movements_[profile] = Movement{operation, finite, ++clock_};
+        // A Stop issued while this movement was in flight reached the device first,
+        // so the movement now runs unopposed. The same holds once close has begun.
+        return closing_ || stops_started_[profile] != stops_seen;
+    }
+
+    void PtzSafetyState::finish_in_flight() noexcept
+    {
+        {
+            std::lock_guard lock(mutex_);
+            if (in_flight_ != 0) --in_flight_;
+        }
+        idle_.notify_all();
+    }
+
+    SafetyActionDetail PtzSafetyState::send_stop(
         const ProfileToken& profile, CallOptions options
     )
     {
+        std::uint64_t started = 0;
+        {
+            std::lock_guard lock(mutex_);
+            ++stops_started_[profile];
+            started = ++clock_;
+        }
         SafetyActionDetail detail;
         detail.attempted = true;
-        set_network_call_options(bounded_safety_options(options));
-        auto stopped = backend_->stop(profile);
-        clear_network_call_options();
+        Result<void> stopped = Error{ErrorCategory::internal, OperationId::ptz_stop};
+        try
+        {
+            ScopedNetworkCallOptions scope(bounded_safety_options(options));
+            stopped = backend_->stop(profile);
+        }
+        catch (const std::exception& error)
+        {
+            stopped = Error{ErrorCategory::internal, OperationId::ptz_stop, error.what()};
+        }
         detail.succeeded = static_cast<bool>(stopped);
         if (stopped)
         {
-            movements_.erase(profile);
+            // Only a movement recorded before this Stop was sent is known halted.
+            std::lock_guard lock(mutex_);
+            const auto found = movements_.find(profile);
+            if (found != movements_.end() && found->second.stamp < started)
+                movements_.erase(found);
         }
         else
         {
@@ -62,33 +118,37 @@ namespace wlonvif
         return detail;
     }
 
-    Result<MoveResult> PtzSafetyState::move(
+    Result<MoveResult> PtzSafetyState::guarded_move(
         const ProfileToken& profile,
         OperationId operation,
         bool finite,
+        const std::string& what,
         CallOptions options,
         const std::function<Result<MoveResult>()>& invoke
     )
     {
-        std::lock_guard lock(mutex_);
-        if (closing_ || cancellation_.stop_requested() || options.cancellation.stop_requested() ||
-            std::chrono::steady_clock::now() >= options.deadline)
+        auto admission = admit(profile, operation, what, options);
+        if (admission.rejection)
         {
-            const bool cancelled = closing_ || cancellation_.stop_requested() ||
-                                   options.cancellation.stop_requested();
-            Error error{cancelled ? ErrorCategory::cancelled : ErrorCategory::timeout,
-                        operation, cancelled ? "movement cancelled" : "movement timed out",
-                        false, true};
-            attach(error, stop_locked(profile, options));
+            auto error = std::move(*admission.rejection);
+            attach(error, send_stop(profile, options));
             return error;
         }
-        auto result = invoke();
+        Result<MoveResult> result = Error{ErrorCategory::internal, operation};
+        try
+        {
+            result = invoke();
+        }
+        catch (const std::exception& error)
+        {
+            result = Error{ErrorCategory::internal, operation, error.what(), false, true};
+        }
         if (result)
         {
-            movements_[profile] = Movement{operation, finite};
-            if (result.value().request_may_have_been_applied)
+            const bool raced = record(profile, operation, finite, admission.stops_seen);
+            if (raced || result.value().request_may_have_been_applied)
             {
-                auto detail = stop_locked(profile, options);
+                auto detail = send_stop(profile, options);
                 result.value().safety_action = detail;
                 if (!detail.succeeded)
                 {
@@ -101,16 +161,30 @@ namespace wlonvif
                     result.value().stop_error = std::move(stop_error);
                 }
             }
+            finish_in_flight();
             return result;
         }
         auto error = result.error();
-        const bool safety_required = error.request_may_have_been_applied ||
-                                     error.category == ErrorCategory::cancelled ||
-                                     error.category == ErrorCategory::timeout;
-        if (error.request_may_have_been_applied)
-            movements_[profile] = Movement{operation, finite};
-        if (safety_required) attach(error, stop_locked(profile, options));
+        bool safety_required = error.request_may_have_been_applied ||
+                               error.category == ErrorCategory::cancelled ||
+                               error.category == ErrorCategory::timeout;
+        if (error.request_may_have_been_applied &&
+            record(profile, operation, finite, admission.stops_seen))
+            safety_required = true;
+        if (safety_required) attach(error, send_stop(profile, options));
+        finish_in_flight();
         return error;
+    }
+
+    Result<MoveResult> PtzSafetyState::move(
+        const ProfileToken& profile,
+        OperationId operation,
+        bool finite,
+        CallOptions options,
+        const std::function<Result<MoveResult>()>& invoke
+    )
+    {
+        return guarded_move(profile, operation, finite, "movement", options, invoke);
     }
 
     Result<void> PtzSafetyState::preset(
@@ -119,40 +193,22 @@ namespace wlonvif
         const std::function<Result<void>()>& invoke
     )
     {
-        std::lock_guard lock(mutex_);
-        if (closing_ || cancellation_.stop_requested() || options.cancellation.stop_requested() ||
-            std::chrono::steady_clock::now() >= options.deadline)
-        {
-            const bool cancelled = closing_ || cancellation_.stop_requested() ||
-                                   options.cancellation.stop_requested();
-            Error error{cancelled ? ErrorCategory::cancelled : ErrorCategory::timeout,
-                        OperationId::goto_preset,
-                        cancelled ? "preset movement cancelled" : "preset movement timed out",
-                        false, true};
-            attach(error, stop_locked(profile, options));
-            return error;
-        }
-        auto result = invoke();
-        if (result)
-        {
-            movements_[profile] = Movement{OperationId::goto_preset, true};
-            return {};
-        }
-        auto error = result.error();
-        if (error.request_may_have_been_applied || error.category == ErrorCategory::cancelled ||
-            error.category == ErrorCategory::timeout)
-        {
-            if (error.request_may_have_been_applied)
-                movements_[profile] = Movement{OperationId::goto_preset, true};
-            attach(error, stop_locked(profile, options));
-        }
-        return error;
+        auto moved = guarded_move(
+            profile, OperationId::goto_preset, true, "preset movement", options,
+            [&invoke]() -> Result<MoveResult>
+            {
+                auto result = invoke();
+                if (!result) return result.error();
+                return MoveResult{};
+            }
+        );
+        if (!moved) return moved.error();
+        return {};
     }
 
     Result<void> PtzSafetyState::stop(const ProfileToken& profile, CallOptions options)
     {
-        std::lock_guard lock(mutex_);
-        auto detail = stop_locked(profile, options);
+        auto detail = send_stop(profile, options);
         if (detail.succeeded) return {};
         Error error{detail.failure_category.value_or(ErrorCategory::internal),
                     OperationId::ptz_stop, "PTZ Stop failed"};
@@ -164,9 +220,21 @@ namespace wlonvif
         const ProfileToken& profile, const std::function<Result<PtzStatus>()>& invoke
     )
     {
-        std::lock_guard lock(mutex_);
+        std::uint64_t observed = 0;
+        {
+            std::lock_guard lock(mutex_);
+            observed = clock_;
+        }
         auto result = invoke();
-        if (result && !result.value().moving) movements_.erase(profile);
+        if (result && !result.value().moving)
+        {
+            // A movement recorded while the status request was in flight may not be
+            // reflected in the reply, so only older movements are cleared.
+            std::lock_guard lock(mutex_);
+            const auto found = movements_.find(profile);
+            if (found != movements_.end() && found->second.stamp <= observed)
+                movements_.erase(found);
+        }
         return result;
     }
 
@@ -174,14 +242,20 @@ namespace wlonvif
     {
         try
         {
-            std::lock_guard lock(mutex_);
-            closing_ = true;
-            bool complete = true;
             std::vector<ProfileToken> profiles;
-            for (const auto& [profile, movement] : movements_)
+            bool complete = true;
             {
-                (void)movement;
-                profiles.push_back(profile);
+                std::unique_lock lock(mutex_);
+                closing_ = true;
+                // Movements already on the wire are allowed to land so they can be
+                // recorded and stopped; each also stops itself on seeing closing_.
+                if (!idle_.wait_until(lock, deadline, [&] { return in_flight_ == 0; }))
+                    complete = false;
+                for (const auto& [profile, movement] : movements_)
+                {
+                    (void)movement;
+                    profiles.push_back(profile);
+                }
             }
             for (const auto& profile : profiles)
             {
@@ -190,11 +264,10 @@ namespace wlonvif
                     complete = false;
                     break;
                 }
-                const auto detail = stop_locked(
-                    profile, {deadline, CancellationSource{}.token()}
-                );
+                const auto detail = send_stop(profile, {deadline, CancellationSource{}.token()});
                 complete = detail.succeeded && complete;
             }
+            std::lock_guard lock(mutex_);
             return complete && movements_.empty();
         }
         catch (...)

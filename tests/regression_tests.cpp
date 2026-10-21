@@ -14,7 +14,9 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <condition_variable>
 #include <cstring>
 #include <iostream>
@@ -131,17 +133,20 @@ namespace
                 std::lock_guard lock(mutex_);
                 bodies.push_back(body);
             }
+            const bool time_request = body.find("GetSystemDateAndTime") != std::string::npos;
+            const auto reply = time_request ? time_reply() : reply_for(body);
+            const long status = time_request ? time_status : 200;
             return Task<Result<HttpResponse>>(
-                [runtime, body, cancelled](auto done) mutable
+                [runtime, reply, status, cancelled](auto done) mutable
                 {
-                    auto work = [done = std::move(done), body, cancelled]() mutable
+                    auto work = [done = std::move(done), reply, status, cancelled]() mutable
                     {
                         if (cancelled)
                         {
                             done(Error{ErrorCategory::cancelled});
                             return;
                         }
-                        done(HttpResponse{200, reply_for(body), "application/soap+xml"});
+                        done(HttpResponse{status, reply, "application/soap+xml"});
                     };
                     if (!runtime->post(work))
                     {
@@ -179,8 +184,42 @@ namespace
         }
 
         std::vector<std::string> bodies;
+        std::chrono::seconds clock_skew{}; ///< Device clock minus the real clock.
+        long time_status{200};             ///< HTTP status for GetSystemDateAndTime.
 
       private:
+        std::string time_reply() const
+        {
+            const auto now = std::chrono::floor<std::chrono::seconds>(
+                std::chrono::system_clock::now() + clock_skew
+            );
+            const auto day = std::chrono::floor<std::chrono::days>(now);
+            const std::chrono::year_month_day date{day};
+            const std::chrono::hh_mm_ss time{now - day};
+            const auto element = [](std::string_view name, auto value)
+            {
+                return "<ns2:" + std::string(name) + ">" + std::to_string(value) + "</ns2:" +
+                       std::string(name) + ">";
+            };
+            // LocalDateTime is a decoy: a wrong offset must not come from it.
+            return "<SOAP-ENV:Envelope "
+                   "xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\" "
+                   "xmlns:ns2=\"http://www.onvif.org/ver10/schema\"><SOAP-ENV:Body>"
+                   "<ns2:GetSystemDateAndTimeResponse><ns2:SystemDateAndTime>"
+                   "<ns2:LocalDateTime><ns2:Time><ns2:Hour>1</ns2:Hour><ns2:Minute>1</ns2:Minute>"
+                   "<ns2:Second>1</ns2:Second></ns2:Time><ns2:Date><ns2:Year>2001</ns2:Year>"
+                   "<ns2:Month>1</ns2:Month><ns2:Day>1</ns2:Day></ns2:Date></ns2:LocalDateTime>"
+                   "<ns2:UTCDateTime><ns2:Time>" +
+                   element("Hour", time.hours().count()) +
+                   element("Minute", time.minutes().count()) +
+                   element("Second", time.seconds().count()) + "</ns2:Time><ns2:Date>" +
+                   element("Year", static_cast<int>(date.year())) +
+                   element("Month", static_cast<unsigned>(date.month())) +
+                   element("Day", static_cast<unsigned>(date.day())) +
+                   "</ns2:Date></ns2:UTCDateTime></ns2:SystemDateAndTime>"
+                   "</ns2:GetSystemDateAndTimeResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>";
+        }
+
         // Answers with SOAP-ENV/ns2 prefixes, which is what real gSOAP devices emit.
         static std::string reply_for(const std::string& request)
         {
@@ -260,6 +299,22 @@ namespace
         std::mutex mutex_;
         std::shared_ptr<Runtime> runtime_;
     };
+
+    /// Return the UsernameToken Created time in @p body minus the real clock.
+    std::optional<std::chrono::seconds> created_skew(const std::string& body)
+    {
+        const auto start = body.find("<wsu:Created>");
+        if (start == std::string::npos) return std::nullopt;
+        int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+        if (std::sscanf(body.c_str() + start + 13, "%4d-%2d-%2dT%2d:%2d:%2dZ",
+                        &year, &month, &day, &hour, &minute, &second) != 6)
+            return std::nullopt;
+        const auto created = std::chrono::sys_days(
+            std::chrono::year(year) / std::chrono::month(static_cast<unsigned>(month)) /
+            std::chrono::day(static_cast<unsigned>(day))
+        ) + std::chrono::hours(hour) + std::chrono::minutes(minute) + std::chrono::seconds(second);
+        return std::chrono::round<std::chrono::seconds>(created - std::chrono::system_clock::now());
+    }
 
     std::string envelope(std::string_view body, std::string_view header = {})
     {
@@ -483,6 +538,70 @@ int main()
         CHECK(scopes && scopes.value().size() == 2);
         CHECK(scopes && scopes.value().size() == 2 &&
               scopes.value()[1] == "onvif://www.onvif.org/name/B");
+    }
+
+    // ---- Signed requests are stamped in device time, measured once per session ----
+    {
+        using namespace std::chrono_literals;
+        const auto near = [](std::optional<std::chrono::seconds> skew, std::chrono::seconds expected)
+        {
+            return skew && std::chrono::abs(*skew - expected) <= 3s;
+        };
+        auto transport = std::make_shared<RecordingTransport>(runtime);
+        transport->clock_skew = -std::chrono::hours(26); // An unset clock, a day behind.
+        auto session = sync(DeviceSession::connect(
+            "http://camera/onvif/device_service",
+            transport,
+            make_same_host_policy(),
+            runtime,
+            Credentials{"operator", "secret"},
+            options()
+        ));
+        CHECK(session);
+        (void)sync(session.value()->get_device_information(options()));
+        CHECK(transport->count("GetSystemDateAndTime") == 1);
+        // The measurement itself is unauthenticated; the device clock is unknown.
+        CHECK(transport->last("GetSystemDateAndTime").find("UsernameToken") == std::string::npos);
+        CHECK(near(created_skew(transport->last("GetDeviceInformation")), -26h));
+
+        // The Media/PTZ backend shares the session's measurement.
+        auto ptz = session.value()->ptz();
+        CHECK(ptz && sync(ptz.value()->relative_move("main", {0.1, {}, {}}, options())));
+        CHECK(near(created_skew(transport->last("RelativeMove")), -26h));
+        (void)sync(session.value()->get_scopes(options()));
+        CHECK(transport->count("GetSystemDateAndTime") == 1);
+        CHECK(sync(session.value()->close(std::chrono::seconds(2))));
+
+        // A device in step with this clock is not perturbed by second truncation.
+        auto synced = std::make_shared<RecordingTransport>(runtime);
+        auto synced_session = sync(DeviceSession::connect(
+            "http://camera/onvif/device_service", synced, make_same_host_policy(), runtime,
+            Credentials{"operator", "secret"}, options()
+        ));
+        (void)sync(synced_session.value()->get_device_information(options()));
+        CHECK(near(created_skew(synced->last("GetDeviceInformation")), 0s));
+
+        // A device that refuses the unauthenticated request is asked only once.
+        auto refusing = std::make_shared<RecordingTransport>(runtime);
+        refusing->time_status = 401;
+        auto refusing_session = sync(DeviceSession::connect(
+            "http://camera/onvif/device_service", refusing, make_same_host_policy(), runtime,
+            Credentials{"operator", "secret"}, options()
+        ));
+        (void)sync(refusing_session.value()->get_device_information(options()));
+        (void)sync(refusing_session.value()->get_scopes(options()));
+        CHECK(refusing->count("GetSystemDateAndTime") == 1);
+        CHECK(near(created_skew(refusing->last("GetScopes")), 0s));
+
+        // Without credentials nothing is signed, so nothing is measured.
+        auto anonymous = std::make_shared<RecordingTransport>(runtime);
+        anonymous->clock_skew = std::chrono::hours(5);
+        auto anonymous_session = sync(DeviceSession::connect(
+            "http://camera/onvif/device_service", anonymous, make_same_host_policy(), runtime,
+            std::nullopt, options()
+        ));
+        (void)sync(anonymous_session.value()->get_device_information(options()));
+        CHECK(anonymous->count("GetSystemDateAndTime") == 0);
     }
 
     // ---- Network backend: PTZ serialization, presets, events, safety Stop ----
@@ -846,6 +965,40 @@ int main()
         }
     }
 #endif
+
+    // ---- A scan reports the addresses its deadline kept it from probing ----
+    {
+        NetworkDiscoveryOptions discovery;
+        discovery.multicast = false;
+        discovery.direct_probe = true;
+        discovery.listen_duration = std::chrono::milliseconds(100);
+        discovery.scan_networks = {"127.0.0.0/29"}; // .1 through .6
+        auto expired = sync(discover_network(
+            runtime, make_same_host_policy(), discovery,
+            CallOptions{std::chrono::steady_clock::now() + std::chrono::milliseconds(1)}
+        ));
+        CHECK(expired);
+        CHECK(expired && expired.value().unchecked.size() + expired.value().incomplete.size() == 6);
+
+        // The default-sized deadline covers the whole range, so nothing is left out.
+        auto bound = discovery_time_bound(discovery);
+        CHECK(bound);
+        auto covered = sync(discover_network(
+            runtime, make_same_host_policy(), discovery,
+            CallOptions{std::chrono::steady_clock::now() + bound.value()}
+        ));
+        CHECK(covered);
+        CHECK(covered && covered.value().unchecked.empty() && covered.value().incomplete.empty());
+
+        // The bound grows with the range rather than staying a fixed few seconds.
+        auto wider = discovery;
+        wider.scan_networks = {"10.0.0.0/24"};
+        auto wider_bound = discovery_time_bound(wider);
+        CHECK(wider_bound && bound && wider_bound.value() > bound.value());
+        CHECK(wider_bound && wider_bound.value() >= wider.request_timeout * (254 / 16));
+        wider.scan_networks = {"not-a-network"};
+        CHECK(!discovery_time_bound(wider));
+    }
 
     CHECK(bool(runtime->shutdown()));
     if (failures != 0)

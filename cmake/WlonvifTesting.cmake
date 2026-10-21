@@ -26,6 +26,35 @@ if(WLONVIF_BUILD_TESTING)
   target_link_libraries(wlonvif_device_tests PRIVATE wlonvif::device)
   add_test(NAME device_services COMMAND wlonvif_device_tests)
 
+  add_executable(wlonvif_device_config_tests ${PROJECT_SOURCE_DIR}/tests/device_config_tests.cpp)
+  target_link_libraries(wlonvif_device_config_tests PRIVATE wlonvif::device)
+  target_compile_definitions(wlonvif_device_config_tests PRIVATE
+    WLONVIF_RECORDED_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures/recorded-camera")
+  add_test(NAME device_configuration COMMAND wlonvif_device_config_tests)
+  set_tests_properties(device_configuration PROPERTIES TIMEOUT 30)
+
+  add_executable(wlonvif_analytics_events_tests
+    ${PROJECT_SOURCE_DIR}/tests/analytics_events_tests.cpp)
+  target_link_libraries(wlonvif_analytics_events_tests PRIVATE wlonvif::device)
+  target_compile_definitions(wlonvif_analytics_events_tests PRIVATE
+    WLONVIF_RECORDED_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures/recorded-camera")
+  add_test(NAME analytics_events COMMAND wlonvif_analytics_events_tests)
+  set_tests_properties(analytics_events PROPERTIES TIMEOUT 30)
+
+  add_executable(wlonvif_imaging_media_tests ${PROJECT_SOURCE_DIR}/tests/imaging_media_tests.cpp)
+  target_link_libraries(wlonvif_imaging_media_tests PRIVATE wlonvif::device)
+  target_compile_definitions(wlonvif_imaging_media_tests PRIVATE
+    WLONVIF_RECORDED_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures/recorded-camera")
+  add_test(NAME imaging_media COMMAND wlonvif_imaging_media_tests)
+  set_tests_properties(imaging_media PROPERTIES TIMEOUT 30)
+
+  add_executable(wlonvif_ptz_management_tests ${PROJECT_SOURCE_DIR}/tests/ptz_management_tests.cpp)
+  target_link_libraries(wlonvif_ptz_management_tests PRIVATE wlonvif::device)
+  target_compile_definitions(wlonvif_ptz_management_tests PRIVATE
+    WLONVIF_RECORDED_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures/recorded-camera")
+  add_test(NAME ptz_management COMMAND wlonvif_ptz_management_tests)
+  set_tests_properties(ptz_management PROPERTIES TIMEOUT 30)
+
   add_executable(wlonvif_service_tests ${PROJECT_SOURCE_DIR}/tests/service_tests.cpp)
   target_link_libraries(wlonvif_service_tests PRIVATE wlonvif::device)
   add_test(NAME media_ptz_discovery_events COMMAND wlonvif_service_tests)
@@ -66,8 +95,21 @@ if(WLONVIF_BUILD_TESTING)
   add_test(NAME ptz_safety COMMAND wlonvif_ptz_safety_tests)
   set_tests_properties(ptz_safety PROPERTIES TIMEOUT 20)
 
+  add_executable(wlonvif_backend_regression_tests
+    ${PROJECT_SOURCE_DIR}/tests/backend_regression_tests.cpp)
+  target_link_libraries(wlonvif_backend_regression_tests PRIVATE wlonvif::client)
+  target_compile_definitions(wlonvif_backend_regression_tests PRIVATE
+    WLONVIF_EXPECTED_VERSION="${PROJECT_VERSION}")
+  add_test(NAME backend_regressions COMMAND wlonvif_backend_regression_tests)
+  set_tests_properties(backend_regressions PROPERTIES TIMEOUT 60)
+
   foreach(target IN ITEMS
+      wlonvif_backend_regression_tests
       wlonvif_device_tests
+      wlonvif_device_config_tests
+      wlonvif_analytics_events_tests
+      wlonvif_imaging_media_tests
+      wlonvif_ptz_management_tests
       wlonvif_service_tests
       wlonvif_qualification_tests
       wlonvif_regression_tests

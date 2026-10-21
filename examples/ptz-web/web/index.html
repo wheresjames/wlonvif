@@ -1,0 +1,530 @@
+<!doctype html>
+<!--
+  wlonvif PTZ web control.
+
+  Before sending this page the server fills in the two placeholders at the top
+  of the script: the camera's profiles and what each can do (JSON), and whether
+  it bridges the camera video as MJPEG. Each placeholder must appear only once.
+
+  The page then opens a session (POST /api/session, which sets a cookie) and a
+  WebSocket to /control. Every 100 ms it sends the current movement *intent*;
+  the server stops the camera if intents stop arriving, so a closed tab or a
+  lost network never leaves it moving.
+
+  The script is inline so the page is a single file; the server's
+  Content-Security-Policy allows only scripts carrying this page's nonce.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <title>wlonvif PTZ</title>
+    <style>
+      /* ---- Layout ---------------------------------------------------------- */
+      :root {
+        color-scheme: dark;
+        font: 16px system-ui;
+        background: #111820;
+        color: #eef;
+      }
+      body {
+        margin: 0;
+        padding: 1rem;
+        display: grid;
+        gap: 1rem;
+      }
+      header,
+      .panel {
+        background: #1b2632;
+        border: 1px solid #405064;
+        border-radius: 0.6rem;
+        padding: 1rem;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 1rem;
+      }
+      .ok {
+        color: #65d98b;
+      }
+      .bad {
+        color: #ff6d6d;
+      }
+      output {
+        font-family: monospace;
+        white-space: pre-wrap;
+      }
+
+      /* ---- Video and pointer area ------------------------------------------ */
+      #view {
+        height: min(55vh, 520px);
+        background: linear-gradient(135deg, #182838, #0d1218);
+        position: relative;
+        touch-action: none; /* Dragging moves the camera, not the page. */
+        border: 2px solid #586b80;
+        border-radius: 0.4rem;
+      }
+      video,
+      #ffmpeg-video {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+      /* Where the pointer is held; it returns to the centre on release. */
+      #dot {
+        position: absolute;
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        background: #54d6ff;
+        transform: translate(-50%, -50%);
+        left: 50%;
+        top: 50%;
+        pointer-events: none;
+      }
+
+      /* ---- Controls -------------------------------------------------------- */
+      button,
+      input {
+        font: inherit;
+        padding: 0.6rem;
+        margin: 0.2rem;
+      }
+      button {
+        border: 0;
+        border-radius: 0.4rem;
+        background: #385674;
+        color: white;
+        transition:
+          transform 90ms ease,
+          background-color 90ms ease,
+          box-shadow 90ms ease;
+        touch-action: none;
+        user-select: none;
+      }
+      button:focus,
+      input:focus {
+        outline: 3px solid #8edaff;
+      }
+      button:disabled,
+      input:disabled,
+      select:disabled {
+        opacity: 0.35;
+        cursor: not-allowed;
+        box-shadow: none;
+        transform: none;
+        animation: none;
+      }
+      .stop {
+        background: #c32632;
+        font-weight: bold;
+        font-size: 1.2rem;
+      }
+      /* A held control glows, so it is clear the camera is being told to move. */
+      button.control-active {
+        background: #1487b8;
+        box-shadow:
+          0 0 0 3px #8edaff,
+          0 0 18px #54d6ff;
+        transform: translateY(2px) scale(0.97);
+        animation: control-pulse 0.7s ease-in-out infinite alternate;
+      }
+      .stop.control-active,
+      .stop.control-ack {
+        background: #ff3545;
+        box-shadow:
+          0 0 0 3px #ff9da5,
+          0 0 22px #ff3545;
+      }
+      .stop.control-ack {
+        animation: stop-ack 0.3s ease-out;
+      }
+      @keyframes control-pulse {
+        to {
+          box-shadow:
+            0 0 0 4px #8edaff,
+            0 0 25px #54d6ff;
+        }
+      }
+      @keyframes stop-ack {
+        50% {
+          transform: scale(0.92);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        button {
+          transition: none;
+        }
+        button.control-active,
+        .stop.control-ack {
+          animation: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <strong>wlonvif PTZ web control</strong>
+      <span id="state" class="bad">DISCONNECTED</span>
+    </header>
+
+    <!-- Hold and drag here to steer, like a joystick; in click mode, click to centre. -->
+    <div id="view" role="application" aria-label="PTZ pointer area">
+      <video id="video" muted autoplay playsinline controls></video>
+      <img id="ffmpeg-video" alt="Live camera video" hidden />
+      <div id="dot"></div>
+    </div>
+
+    <div class="grid">
+      <section class="panel" aria-label="Manual PTZ controls">
+        <label>
+          Profile
+          <select id="profile" aria-label="ONVIF media profile"></select>
+        </label>
+        <br />
+        <button data-k="up" aria-pressed="false">Tilt up</button>
+        <button data-k="left" aria-pressed="false">Pan left</button>
+        <button class="stop" id="stop">STOP</button>
+        <button data-k="right" aria-pressed="false">Pan right</button>
+        <button data-k="down" aria-pressed="false">Tilt down</button>
+        <button data-k="zin" aria-pressed="false">Zoom in</button>
+        <button data-k="zout" aria-pressed="false">Zoom out</button>
+        <p id="capabilities" aria-live="polite"></p>
+      </section>
+
+      <section class="panel">
+        <label><input id="click" type="checkbox" /> Click/box mode</label>
+        <label><input id="invert-pan" type="checkbox" /> Reverse click pan</label>
+        <label><input id="invert-tilt" type="checkbox" /> Reverse click tilt</label>
+        <p>
+          In click mode, click to center or drag for bounded box zoom. Direction reversal affects
+          click and box movement only. Otherwise the viewport is a virtual joystick. Keyboard:
+          arrows/WASD, Q/E zoom, Shift precision, Space Stop.
+        </p>
+        <input
+          id="video-url"
+          aria-label="Browser-playable video URL"
+          placeholder="Browser-playable video URL"
+        />
+        <button id="load-video">Load video</button>
+        <br />
+        <input id="preset" aria-label="Preset token" placeholder="Preset token" />
+        <button id="goto">Go to preset</button>
+        <br />
+        <input id="tour" aria-label="Tour preset tokens" placeholder="Tour: preset1,preset2" />
+        <button id="start-tour">Start tour</button>
+        <output id="telemetry">Waiting for session</output>
+      </section>
+    </div>
+
+    <script nonce="wlonvif-static-ui">
+      const $ = (selector) => document.querySelector(selector);
+      const state = $('#state');
+      const telemetry = $('#telemetry');
+      const view = $('#view');
+      const dot = $('#dot');
+
+      // Filled in by the server: { profiles: [{ token, name, continuous_pan_tilt,
+      // continuous_zoom, relative_pan_tilt, relative_zoom, presets }], selected }.
+      const ptzConfiguration = __PTZ_CONFIGURATION__;
+      const ffmpegEnabled = __FFMPEG_ENABLED__;
+
+      let socket;
+      let sequence = 0; // Numbers each message; the server rejects replays.
+      const keys = new Set(); // Keys held down, lower case, such as 'arrowup' or 'shift'.
+      let pointer = null; // Joystick position, -1 to 1 on each axis, while dragging.
+      let dragStart = null; // Where the pointer went down in the video area.
+      let activeCapabilities = {}; // The selected profile's entry in ptzConfiguration.
+
+      // ---- Settings remembered by the browser --------------------------------------
+
+      for (const id of ['invert-pan', 'invert-tilt']) {
+        const control = $('#' + id);
+        control.checked = localStorage.getItem('wlonvif-' + id) === 'true';
+        control.onchange = () => localStorage.setItem('wlonvif-' + id, String(control.checked));
+      }
+
+      // With the server's FFmpeg bridge, the video comes from /video.mjpeg instead.
+      if (ffmpegEnabled) {
+        $('#video').hidden = true;
+        $('#video-url').disabled = true;
+        $('#load-video').disabled = true;
+      }
+
+      // ---- Profiles and what they can do -----------------------------------------------
+
+      const profileSelect = $('#profile');
+      profileSelect.disabled = true; // Until the control socket is open.
+      for (const profile of ptzConfiguration.profiles) {
+        const option = document.createElement('option');
+        option.value = profile.token;
+        option.textContent = profile.name ? `${profile.name} (${profile.token})` : profile.token;
+        profileSelect.append(option);
+      }
+      profileSelect.value = ptzConfiguration.selected;
+
+      /** Enable only the controls the selected profile supports, and list them. */
+      const applyProfile = () => {
+        activeCapabilities =
+          ptzConfiguration.profiles.find((value) => value.token === profileSelect.value) || {};
+        const caps = activeCapabilities;
+        for (const b of document.querySelectorAll(
+          '[data-k="up"],[data-k="down"],[data-k="left"],[data-k="right"]',
+        )) {
+          b.disabled = !caps.continuous_pan_tilt;
+        }
+        for (const b of document.querySelectorAll('[data-k="zin"],[data-k="zout"]')) {
+          b.disabled = !caps.continuous_zoom;
+        }
+        // Click and box moves are relative moves.
+        for (const id of ['click', 'invert-pan', 'invert-tilt']) {
+          $('#' + id).disabled = !caps.relative_pan_tilt;
+        }
+        for (const id of ['preset', 'goto', 'tour', 'start-tour']) {
+          $('#' + id).disabled = !caps.presets;
+        }
+        const available = [
+          ['manual pan/tilt', caps.continuous_pan_tilt],
+          ['continuous zoom', caps.continuous_zoom],
+          ['click center', caps.relative_pan_tilt],
+          ['box zoom', caps.relative_pan_tilt && caps.relative_zoom],
+          ['presets', caps.presets],
+        ]
+          .filter(([, supported]) => supported)
+          .map(([name]) => name);
+        $('#capabilities').textContent = available.length
+          ? 'Available: ' + available.join(', ')
+          : 'No PTZ operations advertised';
+      };
+      applyProfile();
+      profileSelect.onchange = () => {
+        keys.clear();
+        syncButtonFeedback();
+        applyProfile();
+        send({ type: 'select_profile', profile: profileSelect.value });
+      };
+
+      // ---- Connection --------------------------------------------------------------
+
+      /** Send a command over the control socket; dropped while disconnected. */
+      const send = (command) => {
+        if (socket?.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ version: 1, sequence: ++sequence, ...command }));
+        }
+      };
+
+      async function connect() {
+        // The session cookie authorizes both the video and the control socket.
+        const response = await fetch('/api/session', { method: 'POST' });
+        if (!response.ok) {
+          state.textContent = 'SESSION FAILED';
+          return;
+        }
+        if (ffmpegEnabled) {
+          const image = $('#ffmpeg-video');
+          image.hidden = false;
+          image.src = '/video.mjpeg';
+        }
+        const scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+        socket = new WebSocket(scheme + location.host + '/control');
+        socket.onopen = () => {
+          state.textContent = 'CONNECTED';
+          state.className = 'ok';
+          profileSelect.disabled = false;
+        };
+        socket.onclose = () => {
+          state.textContent = 'DISCONNECTED';
+          state.className = 'bad';
+          profileSelect.disabled = true;
+        };
+        // Each reply carries the camera's telemetry, or the error.
+        socket.onmessage = (event) => (telemetry.textContent = event.data);
+      }
+      connect();
+
+      // ---- Movement intent -----------------------------------------------------------
+
+      /** The velocity the user is asking for now: keys, buttons, or the dragged pointer. */
+      const intent = () => {
+        const held = (...names) => names.some((name) => keys.has(name));
+        let pan = held('d', 'arrowright') - held('a', 'arrowleft');
+        let tilt = held('w', 'arrowup') - held('s', 'arrowdown');
+        let zoom = held('e') - held('q');
+        const scale = held('shift') ? 0.25 : 1; // Shift for fine control.
+        if (pointer) {
+          pan = pointer.x;
+          tilt = -pointer.y; // Screen y grows downwards; tilt up is positive.
+        }
+        if (!activeCapabilities.continuous_pan_tilt) pan = tilt = 0;
+        if (!activeCapabilities.continuous_zoom) zoom = 0;
+        return { pan: pan * scale, tilt: tilt * scale, zoom: zoom * scale };
+      };
+      // Sent even when idle: a zero intent is how the camera is told to stop,
+      // and the steady stream is what keeps the server's lease alive.
+      setInterval(() => send({ type: 'intent', ...intent() }), 100);
+
+      // ---- Buttons and keyboard ------------------------------------------------------
+
+      // Each button acts like holding its first key.
+      const buttonKeys = {
+        up: ['w', 'arrowup'],
+        down: ['s', 'arrowdown'],
+        left: ['a', 'arrowleft'],
+        right: ['d', 'arrowright'],
+        zin: ['e'],
+        zout: ['q'],
+      };
+
+      /** Light up the buttons whose keys are held. */
+      const syncButtonFeedback = () => {
+        for (const b of document.querySelectorAll('[data-k]')) {
+          const active = buttonKeys[b.dataset.k].some((k) => keys.has(k));
+          b.classList.toggle('control-active', active);
+          b.setAttribute('aria-pressed', String(active));
+        }
+      };
+
+      /** A brief flash on STOP, so the press is seen even when nothing was moving. */
+      const acknowledgeStop = () => {
+        const b = $('#stop');
+        b.classList.remove('control-ack');
+        requestAnimationFrame(() => b.classList.add('control-ack'));
+        setTimeout(() => b.classList.remove('control-ack'), 320);
+      };
+
+      addEventListener('keydown', (event) => {
+        const key = event.key.toLowerCase();
+        keys.add(key);
+        syncButtonFeedback();
+        if (key === ' ') {
+          event.preventDefault();
+          acknowledgeStop();
+          send({ type: 'stop' });
+        }
+      });
+      addEventListener('keyup', (event) => {
+        keys.delete(event.key.toLowerCase());
+        syncButtonFeedback();
+      });
+
+      for (const b of document.querySelectorAll('[data-k]')) {
+        const key = buttonKeys[b.dataset.k][0];
+        const press = (event) => {
+          event.preventDefault();
+          b.setPointerCapture(event.pointerId); // Keep receiving the release.
+          keys.add(key);
+          syncButtonFeedback();
+        };
+        const release = () => {
+          keys.delete(key);
+          syncButtonFeedback();
+        };
+        b.onpointerdown = press;
+        b.onpointerup = release;
+        b.onpointercancel = release;
+        b.onlostpointercapture = release;
+      }
+      $('#stop').onclick = () => {
+        acknowledgeStop();
+        send({ type: 'stop' });
+      };
+
+      // ---- Video area: joystick, click to centre, drag a box to zoom --------------------
+
+      /** The pointer position as -1 to 1 on each axis, 0 at the centre. */
+      const normalized = (event) => ({
+        x: (2 * event.offsetX) / view.clientWidth - 1,
+        y: (2 * event.offsetY) / view.clientHeight - 1,
+      });
+      const moveDot = (event) => {
+        dot.style.left = event.offsetX + 'px';
+        dot.style.top = event.offsetY + 'px';
+      };
+
+      view.onpointerdown = (event) => {
+        view.setPointerCapture(event.pointerId);
+        dragStart = { x: event.offsetX, y: event.offsetY };
+        if (!$('#click').checked && activeCapabilities.continuous_pan_tilt) {
+          pointer = normalized(event);
+        }
+        moveDot(event);
+      };
+      view.onpointermove = (event) => {
+        if (pointer) {
+          pointer = normalized(event);
+          moveDot(event);
+        }
+      };
+      view.onpointerup = (event) => {
+        if (!dragStart) return;
+        const dx = Math.abs(event.offsetX - dragStart.x);
+        const dy = Math.abs(event.offsetY - dragStart.y);
+        const clickMode = $('#click').checked;
+        const invert_pan = $('#invert-pan').checked;
+        const invert_tilt = $('#invert-tilt').checked;
+        pointer = null;
+        dot.style.left = dot.style.top = '50%';
+        // The server converts pixels to camera movement using its calibration.
+        const size = { width: view.clientWidth, height: view.clientHeight };
+        if (clickMode && dx > 15 && dy > 15 && activeCapabilities.relative_zoom) {
+          // A dragged box: centre it and zoom so it fills the view.
+          send({
+            type: 'box',
+            x: dragStart.x,
+            y: dragStart.y,
+            x2: event.offsetX,
+            y2: event.offsetY,
+            ...size,
+            invert_pan,
+            invert_tilt,
+          });
+        } else if (clickMode && activeCapabilities.relative_pan_tilt) {
+          // A click: move the camera so that point becomes the centre.
+          send({
+            type: 'click',
+            x: event.offsetX,
+            y: event.offsetY,
+            ...size,
+            invert_pan,
+            invert_tilt,
+          });
+        }
+        dragStart = null;
+      };
+
+      // ---- Presets, tours, and a manual video URL ----------------------------------------
+
+      $('#goto').onclick = () => {
+        const preset = $('#preset').value.trim();
+        if (preset) send({ type: 'preset', preset });
+      };
+      $('#start-tour').onclick = () => {
+        const presets = $('#tour')
+          .value.split(',')
+          .map((token) => token.trim())
+          .filter(Boolean);
+        if (presets.length) send({ type: 'tour', presets, dwell_ms: 2000, repeats: 1 });
+      };
+      $('#load-video').onclick = () => ($('#video').src = $('#video-url').value);
+
+      // ---- Safety ----------------------------------------------------------------------
+
+      // Never leave the camera moving when the page loses focus or is hidden.
+      const safety = () => {
+        keys.clear();
+        syncButtonFeedback();
+        pointer = null;
+        send({ type: 'stop' });
+      };
+      addEventListener('blur', safety);
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) safety();
+      });
+    </script>
+  </body>
+</html>

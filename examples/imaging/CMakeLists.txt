@@ -1,0 +1,3 @@
+add_executable(wlonvif-imaging main.cpp)
+target_link_libraries(wlonvif-imaging PRIVATE wlonvif_example_support)
+wlonvif_apply_project_options(wlonvif-imaging)

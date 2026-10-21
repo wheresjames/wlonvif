@@ -5,6 +5,7 @@
  * @brief Public C++ API for ONVIF clients, discovery, events, and virtual devices.
  */
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -100,7 +101,44 @@ namespace wlonvif
         event_subscribe,          ///< Create a PullPoint subscription.
         event_pull,               ///< PullPoint event retrieval.
         event_renew,              ///< Event subscription renewal.
-        event_close               ///< Event subscription closure.
+        event_close,              ///< Event subscription closure.
+        set_system_date_and_time, ///< Device clock configuration.
+        get_ntp,                  ///< NTP configuration query.
+        set_ntp,                  ///< NTP configuration change.
+        set_scopes,               ///< Replace configurable scopes.
+        add_scopes,               ///< Add configurable scopes.
+        remove_scopes,            ///< Remove configurable scopes.
+        get_event_properties,     ///< Event topic discovery.
+        get_analytics_modules,    ///< Analytics module query.
+        modify_analytics_modules, ///< Analytics module change.
+        get_analytics_rules,      ///< Analytics rule query.
+        modify_analytics_rules,   ///< Analytics rule change.
+        get_video_sources,        ///< Media video source query.
+        get_imaging_settings,     ///< Imaging settings query.
+        set_imaging_settings,     ///< Imaging settings change.
+        get_imaging_options,      ///< Imaging setting ranges query.
+        get_video_encoder_options,     ///< Video encoder option query.
+        set_video_encoder_configuration, ///< Video encoder change.
+        set_preset,               ///< Save the current position as a preset.
+        remove_preset,            ///< Delete a preset.
+        get_preset_tours,         ///< Preset tour query.
+        create_preset_tour,       ///< Create an empty preset tour.
+        modify_preset_tour,       ///< Change a preset tour.
+        operate_preset_tour,      ///< Start, stop, or pause a preset tour.
+        remove_preset_tour,       ///< Delete a preset tour.
+        get_ptz_configuration,    ///< PTZ configuration query.
+        set_ptz_configuration,    ///< PTZ configuration change.
+        get_hostname,             ///< Hostname query.
+        set_hostname,             ///< Hostname change.
+        get_network_interfaces,   ///< Network interface query.
+        get_dns,                  ///< DNS configuration query.
+        get_network_default_gateway, ///< Default gateway query.
+        get_network_protocols,    ///< HTTP/RTSP port query.
+        get_discovery_mode,       ///< WS-Discovery visibility query.
+        set_discovery_mode,       ///< WS-Discovery visibility change.
+        get_users,                ///< Device account query.
+        system_reboot,            ///< Device restart.
+        custom                    ///< Caller-composed request sent with DeviceSession::call().
     };
 
     /// Outcome of a bounded best-effort safety action.
@@ -283,6 +321,14 @@ namespace wlonvif
         std::size_t register_shutdown_participant(std::function<void()> participant);
         /// Remove a previously registered shutdown participant.
         void unregister_shutdown_participant(std::size_t identifier) noexcept;
+        /**
+         * @brief Return true when called from any Runtime's worker thread.
+         *
+         * Completions run on the worker, so code that would block waiting for
+         * another completion (for example joining a thread that is itself waiting
+         * on one) must not do so here; it uses this to choose a non-blocking path.
+         */
+        static bool on_worker_thread() noexcept;
 
       private:
         struct State;
@@ -300,23 +346,37 @@ namespace wlonvif
         /// Return true after the associated source requests cancellation.
         bool stop_requested() const noexcept;
 
-        /// Return a token cancelled when either input token is cancelled.
+        /**
+         * @brief Return a token cancelled when either input token is cancelled.
+         *
+         * Linking is transitive: every source observed by either input, including
+         * sources it was itself linked from, is observed by the result. Keeping
+         * only one state per input would silently drop a link whenever an already
+         * linked token is linked again.
+         */
         static CancellationToken linked(CancellationToken first, CancellationToken second)
         {
-            return CancellationToken(std::move(first.state_), std::move(second.state_));
+            CancellationToken result;
+            result.states_ = std::move(first.states_);
+            for (auto& state : second.states_)
+            {
+                if (std::find(result.states_.begin(), result.states_.end(), state) ==
+                    result.states_.end())
+                {
+                    result.states_.push_back(std::move(state));
+                }
+            }
+            return result;
         }
 
       private:
         friend class CancellationSource;
+        CancellationToken() = default;
         explicit CancellationToken(std::shared_ptr<std::atomic_bool> state)
-            : state_(std::move(state))
         {
+            if (state) states_.push_back(std::move(state));
         }
-        CancellationToken(
-            std::shared_ptr<std::atomic_bool> state, std::shared_ptr<std::atomic_bool> other
-        ) : state_(std::move(state)), other_(std::move(other)) {}
-        std::shared_ptr<std::atomic_bool> state_;
-        std::shared_ptr<std::atomic_bool> other_;
+        std::vector<std::shared_ptr<std::atomic_bool>> states_;
     };
     /// Owner that can request cancellation for associated CancellationToken values.
     class CancellationSource
@@ -452,7 +512,7 @@ namespace wlonvif
 
     enum class EndpointPurpose
     {
-        device, media, ptz, events, download
+        device, media, ptz, events, download, analytics, imaging
     };
 
     enum class EndpointProvenance
@@ -624,10 +684,56 @@ namespace wlonvif
         std::string hardware_id;      ///< Hardware identifier.
     };
 
-    /// Normalized UTC device time.
+    /// How a device keeps its clock.
+    enum class DateTimeType
+    {
+        manual, ///< Set explicitly with SetSystemDateAndTime.
+        ntp     ///< Synchronized from the NTP servers in GetNTP/SetNTP.
+    };
+
+    /// Normalized UTC device time and the clock configuration behind it.
     struct SystemDateAndTime
     {
         std::chrono::system_clock::time_point utc; ///< Device UTC time.
+        DateTimeType type{DateTimeType::manual};   ///< Current clock source.
+        bool daylight_savings{};                   ///< Whether daylight saving is applied.
+        std::string time_zone; ///< POSIX TZ string as reported; empty when absent.
+    };
+
+    /// Arguments for DeviceSession::set_system_date_and_time().
+    struct SystemDateAndTimeSettings
+    {
+        DateTimeType type{DateTimeType::ntp}; ///< Clock source to use.
+        bool daylight_savings{};              ///< Whether daylight saving is applied.
+        /// POSIX TZ string such as `CET-1CEST,M3.5.0,M10.5.0/3`; omitted when unset,
+        /// which leaves the device's time zone unchanged.
+        std::optional<std::string> time_zone;
+        /// UTC time to set. Required for DateTimeType::manual, rejected for NTP.
+        std::optional<std::chrono::system_clock::time_point> utc;
+    };
+
+    /// Device NTP configuration (GetNTP/SetNTP).
+    struct NtpConfiguration
+    {
+        bool from_dhcp{}; ///< Whether servers are taken from DHCP.
+        /// Configured servers: IPv4 or IPv6 addresses, or DNS names.
+        std::vector<std::string> servers;
+        /// Servers learned from DHCP; reported only, never sent by set_ntp().
+        std::vector<std::string> dhcp_servers;
+    };
+
+    /// Whether a device lets a scope be changed.
+    enum class ScopeDefinition
+    {
+        fixed,       ///< Built into the device; SetScopes and RemoveScopes refuse it.
+        configurable ///< Added by a client; may be replaced or removed.
+    };
+
+    /// One scope URI and its definition, from GetScopes.
+    struct ScopeEntry
+    {
+        std::string uri;                                     ///< Scope URI.
+        ScopeDefinition definition{ScopeDefinition::fixed}; ///< Fixed or configurable.
     };
 
     /// Advertised ONVIF service endpoint.
@@ -643,6 +749,8 @@ namespace wlonvif
         std::optional<std::string> media_xaddr;  ///< Advertised Media endpoint.
         std::optional<std::string> ptz_xaddr;    ///< Advertised PTZ endpoint.
         std::optional<std::string> events_xaddr; ///< Advertised Event endpoint.
+        std::optional<std::string> analytics_xaddr; ///< Advertised Analytics endpoint.
+        std::optional<std::string> imaging_xaddr;   ///< Advertised Imaging endpoint.
     };
 
     using ProfileToken = std::string; ///< Opaque Media profile token.
@@ -653,6 +761,152 @@ namespace wlonvif
     {
         ProfileToken token; ///< Opaque profile token used by later operations.
         std::string name;   ///< Human-readable profile name.
+        /// Token of the profile's video analytics configuration; empty when none.
+        std::string video_analytics_configuration;
+    };
+
+    /// Width and height in pixels.
+    struct Resolution
+    {
+        int width{};  ///< Width in pixels.
+        int height{}; ///< Height in pixels.
+        friend bool operator==(const Resolution&, const Resolution&) = default;
+    };
+
+    /// Inclusive integer range reported by a device.
+    struct IntegerRange
+    {
+        int minimum{}; ///< Smallest accepted value.
+        int maximum{}; ///< Largest accepted value.
+    };
+
+    /**
+     * @brief A Media1 video encoder configuration (tt:VideoEncoderConfiguration).
+     *
+     * Every field is read back and sent again by
+     * MediaClient::set_video_encoder_configuration(), so change the fields of a
+     * configuration obtained from the device rather than building one from scratch.
+     */
+    struct VideoEncoderConfiguration
+    {
+        std::string token;        ///< Configuration token.
+        std::string name;         ///< Configuration name.
+        int use_count{};          ///< Number of profiles using it.
+        std::string encoding;     ///< `H264`, `JPEG`, or `MPEG4`.
+        Resolution resolution;    ///< Encoded size.
+        double quality{};         ///< Device quality level; see VideoEncoderOptions.
+        int frame_rate_limit{};   ///< Maximum frames per second.
+        int encoding_interval{};  ///< Encode every Nth frame.
+        int bitrate_limit{};      ///< Maximum bitrate in kbit/s.
+        std::optional<int> gov_length; ///< Frames between key frames (H.264, MPEG-4).
+        std::string profile;      ///< H.264 or MPEG-4 profile, such as `Main`.
+        std::string multicast_address;    ///< Multicast group, or `0.0.0.0` when unused.
+        int multicast_port{};             ///< Multicast port.
+        int multicast_ttl{};              ///< Multicast time-to-live.
+        bool multicast_auto_start{};      ///< Whether multicast starts without a client.
+        std::string session_timeout;      ///< RTSP session timeout, an xs:duration.
+    };
+
+    /// A Media1 audio encoder configuration.
+    struct AudioEncoderConfiguration
+    {
+        std::string token;    ///< Configuration token.
+        std::string name;     ///< Configuration name.
+        std::string encoding; ///< `G711`, `G726`, or `AAC`.
+        int bitrate{};        ///< Bitrate as reported (kbit/s per ONVIF; some devices send bit/s).
+        int sample_rate{};    ///< Sample rate as reported (kHz per ONVIF; some devices send Hz).
+    };
+
+    /// The part of a video source a profile uses.
+    struct VideoSourceConfiguration
+    {
+        std::string token;        ///< Configuration token.
+        std::string name;         ///< Configuration name.
+        std::string source_token; ///< Video source token, as used by ImagingClient.
+        int x{};                  ///< Left edge of the used area.
+        int y{};                  ///< Top edge of the used area.
+        int width{};              ///< Width of the used area.
+        int height{};             ///< Height of the used area.
+    };
+
+    /// Everything a Media profile combines, from Media GetProfiles.
+    struct ProfileConfiguration
+    {
+        ProfileToken token; ///< Profile token.
+        std::string name;   ///< Profile name.
+        bool fixed{};       ///< Whether the device prevents deleting the profile.
+        std::optional<VideoSourceConfiguration> video_source;   ///< Video input, if any.
+        std::optional<VideoEncoderConfiguration> video_encoder; ///< Video encoder, if any.
+        std::string audio_source;                               ///< Audio source token, if any.
+        std::optional<AudioEncoderConfiguration> audio_encoder; ///< Audio encoder, if any.
+        std::string ptz_configuration;             ///< PTZ configuration token, if any.
+        std::string video_analytics_configuration; ///< Analytics configuration token, if any.
+    };
+
+    /// What one encoding accepts, within VideoEncoderOptions.
+    struct VideoEncodingOptions
+    {
+        std::string encoding;                ///< `H264`, `JPEG`, or `MPEG4`.
+        std::vector<Resolution> resolutions; ///< Selectable sizes.
+        IntegerRange frame_rate;             ///< Frame rate limit range.
+        IntegerRange encoding_interval;      ///< Encoding interval range.
+        std::optional<IntegerRange> gov_length; ///< GOP length range (H.264, MPEG-4).
+        std::optional<IntegerRange> bitrate;    ///< Bitrate range in kbit/s, when reported.
+        std::vector<std::string> profiles;      ///< Supported H.264 or MPEG-4 profiles.
+    };
+
+    /// What a video encoder configuration accepts.
+    struct VideoEncoderOptions
+    {
+        IntegerRange quality;                         ///< Quality range.
+        std::vector<VideoEncodingOptions> encodings;  ///< One entry per supported encoding.
+    };
+
+    /// A physical video input, from Media GetVideoSources.
+    struct VideoSource
+    {
+        std::string token;   ///< Token used by the Imaging service.
+        double framerate{};  ///< Native frame rate.
+        int width{};         ///< Native width in pixels.
+        int height{};        ///< Native height in pixels.
+    };
+
+    /**
+     * @brief Image adjustments of one video source (tt:ImagingSettings20).
+     *
+     * Every field is optional: a device reports only what it supports, and
+     * ImagingClient::set_settings() sends only the fields that are set.
+     */
+    struct ImagingSettings
+    {
+        std::optional<double> brightness;       ///< Device units; see ImagingOptions.
+        std::optional<double> color_saturation; ///< Device units; see ImagingOptions.
+        std::optional<double> contrast;         ///< Device units; see ImagingOptions.
+        std::optional<double> sharpness;        ///< Device units; see ImagingOptions.
+        std::optional<std::string> ir_cut_filter;          ///< `ON`, `OFF`, or `AUTO`.
+        std::optional<std::string> backlight_compensation; ///< Mode, `ON` or `OFF`.
+        std::optional<std::string> wide_dynamic_range;     ///< Mode, `ON` or `OFF`.
+        std::optional<std::string> white_balance;          ///< Mode, `AUTO` or `MANUAL`.
+    };
+
+    /// Inclusive range of a numeric imaging setting.
+    struct ImagingRange
+    {
+        double minimum{}; ///< Smallest accepted value.
+        double maximum{}; ///< Largest accepted value.
+    };
+
+    /// What a video source lets ImagingClient::set_settings() change.
+    struct ImagingOptions
+    {
+        std::optional<ImagingRange> brightness;       ///< Absent when unsupported.
+        std::optional<ImagingRange> color_saturation; ///< Absent when unsupported.
+        std::optional<ImagingRange> contrast;         ///< Absent when unsupported.
+        std::optional<ImagingRange> sharpness;        ///< Absent when unsupported.
+        std::vector<std::string> ir_cut_filter_modes;          ///< Empty when unsupported.
+        std::vector<std::string> backlight_compensation_modes; ///< Empty when unsupported.
+        std::vector<std::string> wide_dynamic_range_modes;     ///< Empty when unsupported.
+        std::vector<std::string> white_balance_modes;          ///< Empty when unsupported.
     };
 
     /// Device-supplied stream or snapshot URI and its validity metadata.
@@ -971,6 +1225,19 @@ namespace wlonvif
         std::uint64_t sequence{};                       ///< Local or device sequence number.
     };
 
+    /// One event topic a device can emit, from GetEventProperties.
+    struct EventTopic
+    {
+        /// Topic expression usable as a subscription filter, such as
+        /// `tns1:RuleEngine/CellMotionDetector/Motion`.
+        std::string topic;
+        /// Property events report a state (initialized, changed, deleted) rather
+        /// than a one-off occurrence.
+        bool property{};
+        std::vector<std::string> source; ///< Names of the Source simple items.
+        std::vector<std::string> data;   ///< Names of the Data simple items.
+    };
+
     /// Observable managed-stream continuity condition.
     enum class StreamHealth
     {
@@ -1069,7 +1336,8 @@ namespace wlonvif
             DiscoveryProbeType::device,
             DiscoveryProbeType::network_video_transmitter
         }; ///< Probe compatibility variants.
-        std::vector<std::uint16_t> ports{80, 443, 8000, 8080, 8443, 8899}; ///< Direct ports.
+        /// Direct-probe ports; 2020 is used by some consumer cameras.
+        std::vector<std::uint16_t> ports{80, 443, 2020, 8000, 8080, 8443, 8899};
         std::vector<std::string> device_paths{"/onvif/device_service"};    ///< Direct paths.
         std::size_t retransmissions{3};   ///< Copies of each Probe using one MessageID.
         std::size_t maximum_hosts{1024};  ///< Hard bound for expanded scan addresses.
@@ -1078,7 +1346,9 @@ namespace wlonvif
         std::chrono::milliseconds initial_retry_delay{50}; ///< Retry backoff base.
         std::chrono::milliseconds listen_duration{3000};   ///< ProbeMatch receive window.
         std::chrono::milliseconds connect_timeout{500};    ///< Direct connection timeout.
-        std::chrono::milliseconds request_timeout{2000};   ///< Direct SOAP timeout.
+        /// Direct SOAP timeout. An address's ports and paths are probed
+        /// concurrently, so this is also the time budget for one address.
+        std::chrono::milliseconds request_timeout{2000};
         /**
          * Optional progress callback invoked on the discovery worker thread.
          * Exceptions thrown by the callback are ignored.
@@ -1142,6 +1412,117 @@ namespace wlonvif
         CallOptions call
     );
 
+    /// Discovery results plus the direct-probe coverage actually achieved.
+    struct DiscoveryReport
+    {
+        std::vector<DeviceCandidate> devices; ///< Deduplicated candidates ordered by address.
+        /// Addresses never directly probed because the deadline came first.
+        std::vector<std::string> unchecked;
+        /// Addresses whose probe the deadline cut short, so absence is unproven.
+        std::vector<std::string> incomplete;
+    };
+
+    /**
+     * @brief Execute discover_devices() and report which addresses it covered.
+     *
+     * An empty result only means "no device" for addresses that appear in
+     * neither DiscoveryReport::unchecked nor DiscoveryReport::incomplete.
+     */
+    Task<Result<DiscoveryReport>> discover_network(
+        std::shared_ptr<Runtime> runtime,
+        std::shared_ptr<EndpointPolicy> endpoint_policy,
+        NetworkDiscoveryOptions options,
+        CallOptions call
+    );
+
+    /**
+     * @brief Worst-case duration of discovery with @p options.
+     *
+     * Covers WS-Discovery listening plus every target and scan address taking
+     * its full request_timeout, so a deadline this far away lets the whole
+     * range be probed. Authorizer latency is not included.
+     * @return The bound, or invalid_argument for a malformed scan network.
+     */
+    Result<std::chrono::milliseconds> discovery_time_bound(const NetworkDiscoveryOptions& options);
+
+    /// Which advertised service a DeviceSession::call() request addresses.
+    enum class OnvifService { device, media, ptz, events, analytics, imaging };
+
+    /// One stop of a preset tour.
+    struct PresetTourSpot
+    {
+        PresetToken preset;                 ///< Preset to visit.
+        std::chrono::seconds stay_time{};   ///< Time to stay; zero leaves it to the device.
+    };
+
+    /// Whether a preset tour is running.
+    enum class PresetTourState { idle, touring, paused, unknown };
+
+    /// A sequence of presets the device visits on its own (tt:PresetTour).
+    struct PresetTour
+    {
+        std::string token;                    ///< Tour token.
+        std::string name;                     ///< Tour name.
+        PresetTourState state{PresetTourState::unknown}; ///< Reported state.
+        bool auto_start{};                    ///< Whether the device starts it by itself.
+        std::vector<PresetTourSpot> spots;    ///< Stops in visiting order.
+    };
+
+    /// Preset tour control action.
+    enum class PresetTourOperation { start, stop, pause };
+
+    /**
+     * @brief Image orientation of a PTZ configuration (tt:PTControlDirection).
+     *
+     * EFlip turns the image and the pan/tilt directions upside down for ceiling
+     * mounting; Reverse inverts the pan/tilt directions only.
+     */
+    struct PtzDirection
+    {
+        std::optional<std::string> eflip;   ///< `OFF`, `ON`, or `Extended`; absent if unsupported.
+        std::optional<std::string> reverse; ///< `OFF`, `ON`, or `AUTO`; absent if unsupported.
+    };
+
+    /// A profile's PTZ configuration and the direction modes it accepts.
+    struct PtzConfiguration
+    {
+        std::string token;      ///< Configuration token.
+        std::string name;       ///< Configuration name.
+        std::string node_token; ///< PTZ node the configuration drives.
+        std::chrono::seconds default_timeout{}; ///< Default continuous-move timeout.
+        PtzDirection direction;                  ///< Current orientation.
+        std::vector<std::string> eflip_modes;    ///< Accepted EFlip modes.
+        std::vector<std::string> reverse_modes;  ///< Accepted Reverse modes.
+    };
+
+    /// Named parameter value of an analytics module or rule (tt:SimpleItem).
+    struct SimpleItem
+    {
+        std::string name;  ///< Parameter name, such as `Sensitivity`.
+        std::string value; ///< Parameter value as text.
+    };
+
+    /**
+     * @brief Structured analytics parameter (tt:ElementItem), such as a cell layout.
+     *
+     * The markup is kept exactly as the device supplied it and sent back unchanged
+     * when the owning module or rule is modified.
+     */
+    struct ElementItem
+    {
+        std::string name; ///< Parameter name, such as `Layout`.
+        std::string xml;  ///< Device-supplied inner markup.
+    };
+
+    /// An analytics module or rule: a named, typed set of parameters (tt:Config).
+    struct AnalyticsConfig
+    {
+        std::string name; ///< Instance name, such as `MyCellMotionModule`.
+        std::string type; ///< Qualified type, such as `tt:CellMotionEngine`.
+        std::vector<SimpleItem> simple_items;   ///< Scalar parameters.
+        std::vector<ElementItem> element_items; ///< Structured parameters.
+    };
+
     /**
      * @brief Injectable backend for Media, PTZ, and Event service behavior.
      *
@@ -1203,6 +1584,120 @@ namespace wlonvif
         );
         /// Unsubscribe one explicit subscription. Idempotent after success.
         virtual Result<void> close_event_subscription(const std::string& token);
+        /// Create a subscription delivering only @p topics; empty means every topic.
+        virtual Result<PullPointSubscriptionInfo> create_filtered_event_subscription(
+            std::chrono::seconds requested_lifetime, const std::vector<std::string>& topics
+        );
+        /// Return the event topics the device can emit.
+        virtual Result<std::vector<EventTopic>> event_topics();
+        /// Return the analytics modules of a video analytics configuration.
+        virtual Result<std::vector<AnalyticsConfig>> analytics_modules(const std::string& configuration);
+        /// Replace the parameters of existing analytics modules, matched by name.
+        virtual Result<void> modify_analytics_modules(
+            const std::string& configuration, const std::vector<AnalyticsConfig>& modules
+        );
+        /// Return the analytics rules of a video analytics configuration.
+        virtual Result<std::vector<AnalyticsConfig>> analytics_rules(const std::string& configuration);
+        /// Replace the parameters of existing analytics rules, matched by name.
+        virtual Result<void> modify_analytics_rules(
+            const std::string& configuration, const std::vector<AnalyticsConfig>& rules
+        );
+        /// Return the device's video sources.
+        virtual Result<std::vector<VideoSource>> video_sources();
+        /// Return the imaging settings of @p source.
+        virtual Result<ImagingSettings> imaging_settings(const std::string& source);
+        /// Apply the set fields of @p settings to @p source.
+        virtual Result<void> set_imaging_settings(
+            const std::string& source, const ImagingSettings& settings, bool persist
+        );
+        /// Return the ranges and modes @p source accepts.
+        virtual Result<ImagingOptions> imaging_options(const std::string& source);
+        /// Return every profile with its full configuration.
+        virtual Result<std::vector<ProfileConfiguration>> profile_configurations();
+        /// Return what video encoder configuration @p configuration accepts.
+        virtual Result<VideoEncoderOptions> video_encoder_options(const std::string& configuration);
+        /// Replace a video encoder configuration.
+        virtual Result<void>
+        set_video_encoder_configuration(const VideoEncoderConfiguration& configuration, bool persist);
+        /// Save the current position as preset @p name, or overwrite @p token when given.
+        virtual Result<PresetToken>
+        set_preset(const ProfileToken& profile, const std::string& name, const PresetToken& token);
+        /// Delete preset @p token.
+        virtual Result<void> remove_preset(const ProfileToken& profile, const PresetToken& token);
+        /// Return the preset tours of @p profile.
+        virtual Result<std::vector<PresetTour>> preset_tours(const ProfileToken& profile);
+        /// Create an empty preset tour and return its token.
+        virtual Result<std::string> create_preset_tour(const ProfileToken& profile);
+        /// Replace the name, auto start, and spots of an existing tour.
+        virtual Result<void> modify_preset_tour(const ProfileToken& profile, const PresetTour& tour);
+        /// Start, stop, or pause tour @p token.
+        virtual Result<void> operate_preset_tour(
+            const ProfileToken& profile, const std::string& token, PresetTourOperation operation
+        );
+        /// Delete tour @p token.
+        virtual Result<void> remove_preset_tour(const ProfileToken& profile, const std::string& token);
+        /// Return the PTZ configuration of @p profile with its direction options.
+        virtual Result<PtzConfiguration> ptz_configuration(const ProfileToken& profile);
+        /// Change the set fields of @p direction in the PTZ configuration of @p profile.
+        virtual Result<void>
+        set_ptz_direction(const ProfileToken& profile, const PtzDirection& direction, bool persist);
+        /// Send caller-composed Body markup to @p service; see DeviceSession::call().
+        virtual Result<std::string>
+        call(OnvifService service, const std::string& body, const std::string& response_name);
+    };
+
+    /// Domain-oriented Imaging client for brightness, contrast, and similar settings.
+    class ImagingClient
+    {
+      public:
+        /// Bind an Imaging client to a runtime and service backend.
+        ImagingClient(std::shared_ptr<Runtime> runtime, std::shared_ptr<ServiceBackend> backend);
+        /// Return the current settings of @p source (see MediaClient::get_video_sources()).
+        Task<Result<ImagingSettings>> get_settings(std::string source, CallOptions options);
+        /**
+         * @brief Apply the set fields of @p settings to @p source.
+         *
+         * Numeric values must be finite. With @p persist the device keeps the
+         * change across reboots.
+         */
+        Task<Result<void>> set_settings(
+            std::string source, ImagingSettings settings, bool persist, CallOptions options
+        );
+        /// Return the ranges and modes @p source accepts.
+        Task<Result<ImagingOptions>> get_options(std::string source, CallOptions options);
+
+      private:
+        std::shared_ptr<Runtime> runtime_;
+        std::shared_ptr<ServiceBackend> backend_;
+    };
+
+    /// Domain-oriented Analytics client for detection modules and rules.
+    class AnalyticsClient
+    {
+      public:
+        /// Bind an Analytics client to a runtime and service backend.
+        AnalyticsClient(std::shared_ptr<Runtime> runtime, std::shared_ptr<ServiceBackend> backend);
+        /**
+         * @brief Return the modules of @p configuration (see
+         * MediaProfile::video_analytics_configuration), such as motion detection.
+         */
+        Task<Result<std::vector<AnalyticsConfig>>>
+        get_modules(std::string configuration, CallOptions options);
+        /// Modify existing modules; each is matched by name and sent in full.
+        Task<Result<void>> modify_modules(
+            std::string configuration, std::vector<AnalyticsConfig> modules, CallOptions options
+        );
+        /// Return the rules of @p configuration, which raise events from module output.
+        Task<Result<std::vector<AnalyticsConfig>>>
+        get_rules(std::string configuration, CallOptions options);
+        /// Modify existing rules; each is matched by name and sent in full.
+        Task<Result<void>> modify_rules(
+            std::string configuration, std::vector<AnalyticsConfig> rules, CallOptions options
+        );
+
+      private:
+        std::shared_ptr<Runtime> runtime_;
+        std::shared_ptr<ServiceBackend> backend_;
     };
 
     /// Domain-oriented Media1 client.
@@ -1217,6 +1712,22 @@ namespace wlonvif
         Task<Result<MediaUri>> get_stream_uri(ProfileToken profile, CallOptions options);
         /// Return a snapshot URI for @p profile.
         Task<Result<MediaUri>> get_snapshot_uri(ProfileToken profile, CallOptions options);
+        /// Return the device's video sources, whose tokens address the Imaging service.
+        Task<Result<std::vector<VideoSource>>> get_video_sources(CallOptions options);
+        /// Return every profile with its source, encoder, PTZ, and analytics configuration.
+        Task<Result<std::vector<ProfileConfiguration>>> get_profile_configurations(CallOptions options);
+        /// Return what video encoder configuration @p configuration accepts.
+        Task<Result<VideoEncoderOptions>>
+        get_video_encoder_options(std::string configuration, CallOptions options);
+        /**
+         * @brief Replace a video encoder configuration, such as its resolution or bitrate.
+         *
+         * Start from a configuration returned by get_profile_configurations(); the
+         * device replaces every field. With @p persist the change survives a reboot.
+         */
+        Task<Result<void>> set_video_encoder_configuration(
+            VideoEncoderConfiguration configuration, bool persist, CallOptions options
+        );
 
       private:
         std::shared_ptr<Runtime> runtime_;
@@ -1257,6 +1768,44 @@ namespace wlonvif
         /// Move @p profile to @p preset.
         Task<Result<void>>
         goto_preset(ProfileToken profile, PresetToken preset, CallOptions options);
+        /**
+         * @brief Save the current position as a preset and return its token.
+         *
+         * An empty @p token creates a new preset named @p name; otherwise that
+         * preset is overwritten with the current position.
+         */
+        Task<Result<PresetToken>>
+        set_preset(ProfileToken profile, std::string name, PresetToken token, CallOptions options);
+        /// Delete a preset.
+        Task<Result<void>> remove_preset(ProfileToken profile, PresetToken preset, CallOptions options);
+        /// Return the preset tours of @p profile.
+        Task<Result<std::vector<PresetTour>>> get_preset_tours(ProfileToken profile, CallOptions options);
+        /// Create an empty tour; fill it with modify_preset_tour() before starting it.
+        Task<Result<std::string>> create_preset_tour(ProfileToken profile, CallOptions options);
+        /// Replace the name, auto start, and spots of tour @p tour.token.
+        Task<Result<void>> modify_preset_tour(ProfileToken profile, PresetTour tour, CallOptions options);
+        /**
+         * @brief Start, stop, or pause a preset tour.
+         *
+         * A started tour moves the camera on its own and keeps running after the
+         * session closes, until it is stopped; the session's safety Stop does not
+         * apply to it.
+         */
+        Task<Result<void>> operate_preset_tour(
+            ProfileToken profile, std::string tour, PresetTourOperation operation, CallOptions options
+        );
+        /// Delete a preset tour.
+        Task<Result<void>> remove_preset_tour(ProfileToken profile, std::string tour, CallOptions options);
+        /// Return the PTZ configuration of @p profile, including its image orientation.
+        Task<Result<PtzConfiguration>> get_configuration(ProfileToken profile, CallOptions options);
+        /**
+         * @brief Change the image orientation (EFlip, Reverse) of @p profile.
+         *
+         * Only set fields change; the rest of the configuration is sent back as
+         * the device reported it. With @p persist the change survives a reboot.
+         */
+        Task<Result<void>>
+        set_direction(ProfileToken profile, PtzDirection direction, bool persist, CallOptions options);
 
       private:
         friend class DeviceSession;
@@ -1345,6 +1894,9 @@ namespace wlonvif
     struct PullPointSubscriptionOptions
     {
         std::chrono::seconds requested_lifetime{60}; ///< Requested initial subscription lifetime.
+        /// Deliver only these topics (ConcreteSet expressions, see EventTopic::topic);
+        /// empty delivers every topic. A trailing `//.` also selects sub-topics.
+        std::vector<std::string> topics;
     };
 
     /// Caller-visible lifecycle state of an explicit PullPoint subscription.
@@ -1391,6 +1943,8 @@ namespace wlonvif
         std::chrono::milliseconds minimum_backoff{250}; ///< Initial reconnect delay.
         std::chrono::milliseconds maximum_backoff{30000}; ///< Maximum reconnect delay.
         std::chrono::seconds requested_lifetime{60}; ///< Subscription and renewal lifetime.
+        /// Topic filter applied to every subscription, including after reconnect.
+        std::vector<std::string> topics;
     };
 
     /// Factory for explicit PullPoint subscriptions and automatic managed streams.
@@ -1407,6 +1961,8 @@ namespace wlonvif
         Task<Result<std::shared_ptr<ManagedEventStream>>> open_managed_stream(
             ManagedEventOptions options, CallOptions call
         );
+        /// Return the event topics the device can emit (GetEventProperties).
+        Task<Result<std::vector<EventTopic>>> get_topics(CallOptions call);
 
       private:
         std::shared_ptr<Runtime> runtime_;
@@ -1446,15 +2002,14 @@ namespace wlonvif
             std::shared_ptr<PullPointSubscription> subscription,
             ManagedEventOptions options
         );
-        void run_managed();
         struct State;
+        // The worker owns only shared State, never this object, so a stream
+        // destroyed on the Runtime thread can let its worker finish on its own
+        // instead of blocking the thread that worker is waiting on.
+        static void run_managed(std::shared_ptr<State> state);
         std::shared_ptr<State> state_;
         std::shared_ptr<Runtime> runtime_;
         std::shared_ptr<ServiceBackend> backend_;
-        std::shared_ptr<PullPointSubscription> subscription_;
-        ManagedEventOptions managed_options_;
-        CancellationSource managed_stop_;
-        std::thread managed_worker_;
     };
 
     /**
@@ -1473,16 +2028,23 @@ namespace wlonvif
      * @param operation Operation metadata identifier.
      * @param body Already-encoded operation body content.
      * @param credentials Optional credentials for the security header.
+     * @param clock_offset Device clock minus local clock, applied to the
+     *        UsernameToken Created timestamp so a device with a skewed clock
+     *        still accepts it.
      * @return Owned UTF-8 SOAP envelope.
      */
     std::string soap_envelope(
         OperationId operation,
         std::string_view body,
-        const std::optional<Credentials>& credentials = {}
+        const std::optional<Credentials>& credentials = {},
+        std::chrono::system_clock::duration clock_offset = {}
     );
 
     std::string soap_envelope(
-        OperationId operation, std::string_view body, const CredentialLease* credentials
+        OperationId operation,
+        std::string_view body,
+        const CredentialLease* credentials,
+        std::chrono::system_clock::duration clock_offset = {}
     );
 
     /**
@@ -1511,6 +2073,59 @@ namespace wlonvif
         std::shared_ptr<Runtime> runtime;
         std::shared_ptr<CredentialProvider> credential_provider;
         CallOptions call;
+    };
+
+    namespace detail
+    {
+        class DeviceClock;
+    }
+
+    /// Device hostname (GetHostname).
+    struct HostnameInformation
+    {
+        bool from_dhcp{}; ///< Whether the name is assigned by DHCP.
+        std::string name; ///< Current hostname.
+    };
+
+    /// One network interface and its IPv4 configuration.
+    struct NetworkInterface
+    {
+        std::string token;            ///< Interface token.
+        bool enabled{};               ///< Whether the interface is enabled.
+        std::string name;             ///< Interface name, such as `eth0`.
+        std::string hardware_address; ///< MAC address as reported.
+        int mtu{};                    ///< Maximum transmission unit.
+        bool ipv4_enabled{};          ///< Whether IPv4 is enabled.
+        bool ipv4_dhcp{};             ///< Whether IPv4 is configured by DHCP.
+        /// IPv4 addresses with prefix length, such as `192.0.2.10/24`.
+        std::vector<std::string> ipv4_addresses;
+    };
+
+    /// DNS resolver configuration (GetDNS).
+    struct DnsInformation
+    {
+        bool from_dhcp{};                        ///< Whether servers come from DHCP.
+        std::vector<std::string> search_domains; ///< Search domains.
+        std::vector<std::string> servers;        ///< Manually configured servers.
+        std::vector<std::string> dhcp_servers;   ///< Servers learned from DHCP.
+    };
+
+    /// A network service the device offers, such as HTTP or RTSP.
+    struct NetworkProtocol
+    {
+        std::string name;       ///< `HTTP`, `HTTPS`, or `RTSP`.
+        bool enabled{};         ///< Whether the protocol is enabled.
+        std::vector<int> ports; ///< Listening ports.
+    };
+
+    /// Whether the device answers WS-Discovery probes.
+    enum class DiscoveryMode { discoverable, non_discoverable };
+
+    /// A device account (GetUsers); passwords are never reported.
+    struct DeviceUser
+    {
+        std::string username; ///< Account name.
+        std::string level;    ///< `Administrator`, `Operator`, `User`, or `Anonymous`.
     };
 
     /// Thread-safe owner of a connected device and all child-operation cancellation.
@@ -1545,6 +2160,82 @@ namespace wlonvif
         Task<Result<SystemDateAndTime>> get_system_date_and_time(CallOptions options);
         /// Execute GetScopes.
         Task<Result<std::vector<std::string>>> get_scopes(CallOptions options);
+        /// Execute GetScopes, keeping whether each scope is fixed or configurable.
+        Task<Result<std::vector<ScopeEntry>>> get_scope_entries(CallOptions options);
+        /**
+         * @brief Execute SetScopes, replacing every configurable scope.
+         *
+         * Devices refuse to overwrite fixed scopes (ter:ScopeOverwrite); use
+         * add_scopes() to supplement them instead.
+         */
+        Task<Result<void>> set_scopes(std::vector<std::string> scopes, CallOptions options);
+        /// Execute AddScopes. Scope URIs must not contain whitespace.
+        Task<Result<void>> add_scopes(std::vector<std::string> scopes, CallOptions options);
+        /// Execute RemoveScopes; only configurable scopes can be removed.
+        Task<Result<void>> remove_scopes(std::vector<std::string> scopes, CallOptions options);
+        /**
+         * @brief Execute SetSystemDateAndTime.
+         *
+         * A successful change also discards the session's measured clock offset,
+         * so later signed requests are stamped against the new device time.
+         */
+        Task<Result<void>> set_system_date_and_time(
+            SystemDateAndTimeSettings settings, CallOptions options
+        );
+        /// Execute GetNTP.
+        Task<Result<NtpConfiguration>> get_ntp(CallOptions options);
+        /// Execute SetNTP with @p configuration's from_dhcp and servers.
+        Task<Result<void>> set_ntp(NtpConfiguration configuration, CallOptions options);
+        /// Execute GetHostname.
+        Task<Result<HostnameInformation>> get_hostname(CallOptions options);
+        /// Execute SetHostname; @p name must be a valid DNS hostname.
+        Task<Result<void>> set_hostname(std::string name, CallOptions options);
+        /// Execute GetNetworkInterfaces.
+        Task<Result<std::vector<NetworkInterface>>> get_network_interfaces(CallOptions options);
+        /// Execute GetDNS.
+        Task<Result<DnsInformation>> get_dns(CallOptions options);
+        /// Execute GetNetworkDefaultGateway, returning IPv4 and IPv6 gateway addresses.
+        Task<Result<std::vector<std::string>>> get_network_default_gateway(CallOptions options);
+        /// Execute GetNetworkProtocols.
+        Task<Result<std::vector<NetworkProtocol>>> get_network_protocols(CallOptions options);
+        /// Execute GetDiscoveryMode.
+        Task<Result<DiscoveryMode>> get_discovery_mode(CallOptions options);
+        /**
+         * @brief Execute SetDiscoveryMode.
+         *
+         * A non-discoverable device ignores WS-Discovery probes; direct probing
+         * (discover_network() with direct_probe) still finds it.
+         */
+        Task<Result<void>> set_discovery_mode(DiscoveryMode mode, CallOptions options);
+        /// Execute GetUsers.
+        Task<Result<std::vector<DeviceUser>>> get_users(CallOptions options);
+        /**
+         * @brief Execute SystemReboot and return the device's message.
+         *
+         * The device restarts shortly after answering; the session's later
+         * requests fail until it is back.
+         */
+        Task<Result<std::string>> system_reboot(CallOptions options);
+        /**
+         * @brief Send any ONVIF request and return its response element's content.
+         *
+         * For operations without a dedicated method. @p body is the complete,
+         * well-formed SOAP Body content, such as `<tds:GetZeroConfiguration/>`;
+         * the prefixes tds, trt, tptz, tev, tan, timg, tt, wsnt, and tns1 are
+         * declared. The request is signed, clock-corrected, and sent to the
+         * endpoint @p service advertises, under the session's endpoint policy.
+         * SOAP Faults are returned as errors with their codes.
+         *
+         * @param service Service whose advertised endpoint receives the request.
+         * @param body Complete SOAP Body content.
+         * @param response_name Local name of the expected response element; when
+         *        empty, the body's first element name plus `Response`.
+         * @param options Deadline and cancellation state.
+         * @return The response element's inner markup.
+         */
+        Task<Result<std::string>> call(
+            OnvifService service, std::string body, std::string response_name, CallOptions options
+        );
         /// Execute GetServices.
         Task<Result<std::vector<Service>>> get_services(CallOptions options);
         /// Execute GetCapabilities.
@@ -1555,6 +2246,10 @@ namespace wlonvif
         Result<std::shared_ptr<PtzClient>> ptz();
         /// Return the explicit Event service client.
         Result<std::shared_ptr<EventClient>> event_client();
+        /// Return the Analytics client for detection modules and rules.
+        Result<std::shared_ptr<AnalyticsClient>> analytics();
+        /// Return the Imaging client for brightness, contrast, and similar settings.
+        Result<std::shared_ptr<ImagingClient>> imaging();
         /// Return a bounded managed Event stream.
         Result<std::shared_ptr<ManagedEventStream>> events(std::size_t maximum_events = 256);
 
@@ -1567,6 +2262,9 @@ namespace wlonvif
             std::shared_ptr<CredentialProvider>
         );
         Task<Result<std::string>> invoke(OperationId, std::string_view response, CallOptions);
+        Task<Result<std::string>> invoke(
+            OperationId, std::string body, std::string_view response, CallOptions, bool idempotent
+        );
         void operation_finished() noexcept;
         void register_runtime_shutdown();
         void shutdown_from_runtime() noexcept;
@@ -1586,6 +2284,7 @@ namespace wlonvif
         std::mutex backend_mutex_;
         std::shared_ptr<ServiceBackend> backend_;
         std::shared_ptr<class PtzSafetyState> ptz_safety_;
+        std::shared_ptr<detail::DeviceClock> clock_;
         bool close_safety_complete_{true};
         std::size_t runtime_shutdown_registration_{};
     };
@@ -1630,6 +2329,27 @@ namespace wlonvif
         void set_stop_delay(std::chrono::milliseconds delay);
         /// Return the number of Stop attempts made for a profile.
         std::size_t stop_attempts(const ProfileToken& profile) const;
+        /// Replace the topics reported by GetEventProperties.
+        void set_event_topics(std::vector<EventTopic> topics);
+        /// Add or replace a detailed profile returned by profile_configurations().
+        void set_profile_configuration(ProfileConfiguration profile);
+        /// Set what a video encoder configuration accepts.
+        void set_video_encoder_options(std::string configuration, VideoEncoderOptions options);
+        /// Set the PTZ configuration reported for @p profile.
+        void set_ptz_configuration(ProfileToken profile, PtzConfiguration configuration);
+        /// Return how many SystemReboot requests the virtual device has accepted.
+        std::size_t reboot_count() const;
+        /// Answer a custom Device-service request through the virtual SOAP handler.
+        Result<std::string>
+        call(OnvifService service, const std::string& body, const std::string& response_name) override;
+        /// Add or replace a video source with its imaging settings and accepted ranges.
+        void set_video_source(VideoSource source, ImagingSettings settings, ImagingOptions options);
+        /// Add or replace the modules and rules of an analytics configuration.
+        void set_analytics(
+            std::string configuration,
+            std::vector<AnalyticsConfig> modules,
+            std::vector<AnalyticsConfig> rules
+        );
         /// Return configured profiles.
         Result<std::vector<MediaProfile>> profiles() override;
         /// Return the configured stream URI.
@@ -1656,6 +2376,68 @@ namespace wlonvif
         Result<void> renew_events() override;
         /// Close the virtual Event subscription.
         Result<void> close_events() override;
+        /// Create a subscription that delivers only events matching @p topics.
+        Result<PullPointSubscriptionInfo> create_filtered_event_subscription(
+            std::chrono::seconds requested_lifetime, const std::vector<std::string>& topics
+        ) override;
+        /// Pull queued events, discarding those outside the subscription's filter.
+        Result<std::vector<Event>> pull_event_subscription(
+            const std::string& token, std::chrono::milliseconds server_timeout, std::size_t maximum
+        ) override;
+        /// Return the configured event topics.
+        Result<std::vector<EventTopic>> event_topics() override;
+        /// Return the configured analytics modules.
+        Result<std::vector<AnalyticsConfig>> analytics_modules(const std::string& configuration) override;
+        /// Replace parameters of configured analytics modules.
+        Result<void> modify_analytics_modules(
+            const std::string& configuration, const std::vector<AnalyticsConfig>& modules
+        ) override;
+        /// Return the configured analytics rules.
+        Result<std::vector<AnalyticsConfig>> analytics_rules(const std::string& configuration) override;
+        /// Replace parameters of configured analytics rules.
+        Result<void> modify_analytics_rules(
+            const std::string& configuration, const std::vector<AnalyticsConfig>& rules
+        ) override;
+        /// Return the configured video sources.
+        Result<std::vector<VideoSource>> video_sources() override;
+        /// Return a configured source's imaging settings.
+        Result<ImagingSettings> imaging_settings(const std::string& source) override;
+        /// Merge the set fields into a source's settings, enforcing its options.
+        Result<void> set_imaging_settings(
+            const std::string& source, const ImagingSettings& settings, bool persist
+        ) override;
+        /// Return a configured source's imaging options.
+        Result<ImagingOptions> imaging_options(const std::string& source) override;
+        /// Return the configured detailed profiles.
+        Result<std::vector<ProfileConfiguration>> profile_configurations() override;
+        /// Return the configured encoder options.
+        Result<VideoEncoderOptions> video_encoder_options(const std::string& configuration) override;
+        /// Replace an encoder in every profile using it, enforcing its options.
+        Result<void> set_video_encoder_configuration(
+            const VideoEncoderConfiguration& configuration, bool persist
+        ) override;
+        /// Save the current virtual position as a preset.
+        Result<PresetToken>
+        set_preset(const ProfileToken& profile, const std::string& name, const PresetToken& token) override;
+        /// Delete a virtual preset.
+        Result<void> remove_preset(const ProfileToken& profile, const PresetToken& token) override;
+        /// Return the virtual preset tours.
+        Result<std::vector<PresetTour>> preset_tours(const ProfileToken& profile) override;
+        /// Create an empty virtual tour.
+        Result<std::string> create_preset_tour(const ProfileToken& profile) override;
+        /// Replace a virtual tour's name, auto start, and spots.
+        Result<void> modify_preset_tour(const ProfileToken& profile, const PresetTour& tour) override;
+        /// Change a virtual tour's state.
+        Result<void> operate_preset_tour(
+            const ProfileToken& profile, const std::string& token, PresetTourOperation operation
+        ) override;
+        /// Delete a virtual tour.
+        Result<void> remove_preset_tour(const ProfileToken& profile, const std::string& token) override;
+        /// Return the configured PTZ configuration.
+        Result<PtzConfiguration> ptz_configuration(const ProfileToken& profile) override;
+        /// Change the virtual orientation, enforcing the accepted modes.
+        Result<void>
+        set_ptz_direction(const ProfileToken& profile, const PtzDirection& direction, bool persist) override;
 
       private:
         std::shared_ptr<Runtime> runtime_;

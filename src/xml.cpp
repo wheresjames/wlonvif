@@ -27,7 +27,14 @@ namespace wlonvif
         bool found = false;
         bool fault = false;
         SoapFaultDetail fault_detail;
-        std::string fault_field;
+        // Fault fields are scoped to the element that opened them. Without the
+        // depth, every later text node in the document is appended to whichever
+        // field opened last.
+        std::string* fault_field = nullptr;
+        int fault_field_depth = -1;
+        int fault_depth = -1;
+        bool fault_finished = false;
+        int open_subcodes = 0;
         // Text is collected only between the response element's start and end tags.
         // Without tracking the depth the response opened at, every later text node
         // in the document is appended too, so a sibling element after the response
@@ -59,23 +66,49 @@ namespace wlonvif
                     response_depth = depth;
                     collecting = xmlTextReaderIsEmptyElement(r) != 1;
                 }
-                if (local && std::string_view(reinterpret_cast<const char*>(local)) == "Fault")
+                if (local && !fault &&
+                    std::string_view(reinterpret_cast<const char*>(local)) == "Fault")
                 {
                     fault = true;
+                    fault_depth = depth;
                 }
-                if (fault && local)
+                else if (fault && !fault_finished && local && !fault_field)
                 {
+                    // SOAP 1.2: Code/Value, Code/Subcode/Value, Reason/Text, Detail.
+                    // SOAP 1.1: faultcode, faultstring, detail.
                     const std::string_view name(reinterpret_cast<const char*>(local));
-                    if (name == "Value")
-                        fault_field = fault_detail.code.empty() ? "code" : "subcode";
-                    else if (name == "Text") fault_field = "reason";
-                    else if (name == "Detail") fault_field = "detail";
+                    std::string* target = nullptr;
+                    if (name == "Subcode") ++open_subcodes;
+                    else if (name == "Value")
+                        target = open_subcodes > 0 ? &fault_detail.subcode : &fault_detail.code;
+                    else if (name == "faultcode") target = &fault_detail.code;
+                    else if (name == "Text" || name == "faultstring")
+                        target = &fault_detail.reason;
+                    else if (name == "Detail" || name == "detail") target = &fault_detail.detail;
+                    if (target && xmlTextReaderIsEmptyElement(r) != 1)
+                    {
+                        // A nested Subcode is more specific than its parent, so its
+                        // Value replaces rather than concatenates.
+                        if (target == &fault_detail.subcode || target == &fault_detail.code)
+                            target->clear();
+                        fault_field = target;
+                        fault_field_depth = depth;
+                    }
                 }
             }
             if (xmlTextReaderNodeType(r) == XML_READER_TYPE_END_ELEMENT && collecting &&
                 depth == response_depth)
             {
                 collecting = false;
+            }
+            if (xmlTextReaderNodeType(r) == XML_READER_TYPE_END_ELEMENT && fault)
+            {
+                if (fault_field && depth == fault_field_depth) fault_field = nullptr;
+                const auto* local = xmlTextReaderConstLocalName(r);
+                const std::string_view name =
+                    local ? reinterpret_cast<const char*>(local) : "";
+                if (!fault_field && name == "Subcode" && open_subcodes > 0) --open_subcodes;
+                if (depth == fault_depth && name == "Fault") fault_finished = true;
             }
             if (xmlTextReaderNodeType(r) == XML_READER_TYPE_DOCUMENT_TYPE)
             {
@@ -99,17 +132,17 @@ namespace wlonvif
                     result += '\n';
                 }
             }
-            if (fault && !fault_field.empty() &&
+            if (fault_field &&
                 (xmlTextReaderNodeType(r) == XML_READER_TYPE_TEXT ||
                  xmlTextReaderNodeType(r) == XML_READER_TYPE_CDATA))
             {
                 const auto* value = reinterpret_cast<const char*>(xmlTextReaderConstValue(r));
                 if (value)
                 {
-                    std::string* target = fault_field == "code" ? &fault_detail.code
-                        : fault_field == "subcode" ? &fault_detail.subcode
-                        : fault_field == "reason" ? &fault_detail.reason : &fault_detail.detail;
-                    target->append(value, std::min<std::size_t>(512 - std::min<std::size_t>(target->size(), 512), std::char_traits<char>::length(value)));
+                    const auto room = 512 - std::min<std::size_t>(fault_field->size(), 512);
+                    fault_field->append(
+                        value, std::min(room, std::char_traits<char>::length(value))
+                    );
                 }
             }
         }

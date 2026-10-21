@@ -43,8 +43,12 @@ reaping it. RTSP uses TCP and is converted to
 stream/authentication failures appear as an empty video surface.
 
 Server shutdown interrupts every accepted HTTP, TLS, WebSocket, and MJPEG socket
-before joining its worker. Initial HTTP and TLS negotiation also have five-second
-deadlines, so incomplete or stalled clients cannot indefinitely retain a worker.
+before joining its worker. Initial HTTP and TLS negotiation have a five-second
+deadline, every response or video-frame write has a ten-second deadline, and a
+control WebSocket that stays silent longer than its lease is closed, so incomplete
+or stalled clients cannot indefinitely retain a worker. The server uses synchronous
+Beast calls, which ignore stream expiry, so these deadlines are enforced by the
+accept loop interrupting expired sockets.
 
 The discovered or explicit stream URI is passed to FFmpeg as an argument. The
 program prints a warning without printing the URI. Embedding credentials in that
@@ -78,7 +82,9 @@ FFmpeg in this deliberately small example.
 The persistent Stop control, Space, focus loss, tab hiding, WebSocket loss and
 lease expiry all request Stop. Fresh manual input invalidates an active automatic
 operation. Preset tours have bounded preset count, dwell and repeats and check for
-cancellation at short intervals.
+cancellation at short intervals. A tour runs in the background, so the same
+browser's Stop, new manual input, profile change or disconnect ends it promptly;
+the idle all-zero intent the browser repeats does not.
 
 Click and box operations use conservative approximate `RelativeMove` unless a
 reviewed calibration file is supplied:

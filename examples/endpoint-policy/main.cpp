@@ -1,4 +1,19 @@
-/** @file main.cpp @brief Demonstrate endpoint authorization without network access. */
+/**
+ * @file main.cpp
+ * @brief wlonvif-endpoint-policy: show which service addresses a device may send you to.
+ *
+ * A device tells clients where its services are (GetServices, GetCapabilities).
+ * A compromised or misconfigured device could name another host, so the
+ * library checks every advertised address against an endpoint policy before
+ * sending credentials there. This example runs the policy offline:
+ *
+ *     wlonvif-endpoint-policy --origin http://192.0.2.10/onvif/device_service \
+ *         --candidate http://192.0.2.10:8080/onvif/media --candidate http://198.51.100.5/
+ *
+ * The default (same host) policy allows another port on the same host;
+ * --strict (same origin) also requires the same scheme and port. Both reject
+ * URLs carrying user information. The exit status is 1 if any is rejected.
+ */
 
 #include <example_support.hpp>
 #include <iostream>
@@ -29,9 +44,18 @@ int main(int argc, char** argv)
             std::cerr << "Missing value for " << argument << '\n';
             return 2;
         }
-        if (argument == "--origin") origin = parsed.value().remaining[++index];
-        else if (argument == "--candidate") candidates.push_back(parsed.value().remaining[++index]);
-        else if (argument == "--strict") strict = true;
+        if (argument == "--origin")
+        {
+            origin = parsed.value().remaining[++index];
+        }
+        else if (argument == "--candidate")
+        {
+            candidates.push_back(parsed.value().remaining[++index]);
+        }
+        else if (argument == "--strict")
+        {
+            strict = true;
+        }
         else
         {
             std::cerr << "Unknown argument: " << argument << '\n';
@@ -43,10 +67,14 @@ int main(int argc, char** argv)
         std::cerr << "--origin and at least one --candidate are required\n";
         return 2;
     }
-    const auto policy = strict ? wlonvif::make_same_origin_policy()
-                               : wlonvif::make_same_host_policy();
+    // The same policies DeviceSession::connect() takes.
+    const auto policy =
+        strict ? wlonvif::make_same_origin_policy() : wlonvif::make_same_host_policy();
     bool rejected = false;
-    if (parsed.value().common.json) std::cout << '[';
+    if (parsed.value().common.json)
+    {
+        std::cout << '[';
+    }
     for (std::size_t index = 0; index < candidates.size(); ++index)
     {
         const auto result = policy->authorize(candidates[index], origin);
@@ -55,6 +83,7 @@ int main(int argc, char** argv)
         {
             std::cout << (index ? "," : "") << "{\"url\":\""
                       << wlonvif::examples::json_escape(
+                             // Never print a password that was part of a candidate URL.
                              wlonvif::examples::redact_url(candidates[index])
                          )
                       << "\",\"authorized\":" << (result ? "true" : "false") << '}';
@@ -65,6 +94,9 @@ int main(int argc, char** argv)
                       << wlonvif::examples::redact_url(candidates[index]) << '\n';
         }
     }
-    if (parsed.value().common.json) std::cout << "]\n";
+    if (parsed.value().common.json)
+    {
+        std::cout << "]\n";
+    }
     return rejected ? 1 : 0;
 }

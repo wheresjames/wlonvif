@@ -2,9 +2,11 @@
 #include <cctype>
 #include <ctime>
 #include <future>
+#include "device_clock.hpp"
 #include "dispatch.hpp"
 #include "network_services.hpp"
 #include "ptz_safety.hpp"
+#include "soap_response.hpp"
 #include "xml_scan.hpp"
 #include <wlonvif/wlonvif.hpp>
 
@@ -264,7 +266,8 @@ namespace wlonvif
         std::shared_ptr<CredentialProvider> c
     )
         : url_(std::move(u)), transport_(std::move(t)), endpoint_policy_(std::move(p)),
-          runtime_(std::move(r)), credential_provider_(std::move(c))
+          runtime_(std::move(r)), credential_provider_(std::move(c)),
+          clock_(std::make_shared<detail::DeviceClock>())
     {
     }
     DeviceSession::~DeviceSession()
@@ -437,16 +440,20 @@ namespace wlonvif
                 // CredentialProvider is an extension point and may synchronously
                 // complete pending acquisitions from close(). Never call it while
                 // holding state_mutex_, because those completions finish operations
-                // by acquiring the same mutex.
-                if (close_credentials) self->credential_provider_->close();
+                // by acquiring the same mutex. The safety Stops below authenticate
+                // with these credentials, so when they run the provider is closed
+                // only after they finish; closing it first fails every Stop sent to
+                // a camera that requires authentication.
+                if (close_credentials && !run_safety) self->credential_provider_->close();
                 if (run_safety)
                 {
                     auto safety = std::move(safety_candidate);
-                    std::thread([self, safety]() mutable
+                    std::thread([self, safety, close_credentials]() mutable
                     {
                         const bool complete = safety->close_all(
                             std::chrono::steady_clock::now() + std::chrono::seconds(5)
                         );
+                        if (close_credentials) self->credential_provider_->close();
                         {
                             std::lock_guard lock(self->state_mutex_);
                             self->close_safety_complete_ = complete;
@@ -454,7 +461,16 @@ namespace wlonvif
                         self->operation_finished();
                     }).detach();
                 }
-                if (immediate) { terminal(CloseResult{true, self->close_safety_complete_}); return; }
+                if (immediate)
+                {
+                    bool safety_complete = false;
+                    {
+                        std::lock_guard lock(self->state_mutex_);
+                        safety_complete = self->close_safety_complete_;
+                    }
+                    terminal(CloseResult{true, safety_complete});
+                    return;
+                }
                 if (cleanup_budget <= std::chrono::milliseconds::zero())
                 {
                     terminal(CloseResult{false, false});
@@ -471,6 +487,7 @@ namespace wlonvif
     void DeviceSession::operation_finished() noexcept
     {
         std::vector<std::function<void(Result<CloseResult>)>> waiters;
+        bool safety_complete = false;
         {
             std::lock_guard lock(state_mutex_);
             if (active_operations_ != 0) --active_operations_;
@@ -479,17 +496,27 @@ namespace wlonvif
                 state_ = State::closed;
                 waiters.swap(close_waiters_);
             }
+            safety_complete = close_safety_complete_;
         }
-        for (auto& waiter : waiters) waiter(CloseResult{true, close_safety_complete_});
+        for (auto& waiter : waiters) waiter(CloseResult{true, safety_complete});
     }
     Task<Result<std::string>>
     DeviceSession::invoke(OperationId op, std::string_view response, CallOptions options)
     {
+        return invoke(op, {}, response, options, true);
+    }
+    Task<Result<std::string>> DeviceSession::invoke(
+        OperationId op, std::string body, std::string_view response, CallOptions options,
+        bool idempotent
+    )
+    {
         return Task<Result<std::string>>(
             [self = shared_from_this(),
              op,
+             body = std::move(body),
              response = std::string(response),
-             options](auto done) mutable
+             options,
+             idempotent](auto done) mutable
             {
                 {
                     std::lock_guard lock(self->state_mutex_);
@@ -511,15 +538,15 @@ namespace wlonvif
                 auto linked = CancellationToken::linked(
                     options.cancellation, self->session_cancellation_.token()
                 );
-                auto send_with = [self, op, response = std::move(response), options, linked,
-                                  done = std::move(done)](
-                                     Result<std::shared_ptr<CredentialLease>> acquired
-                                  ) mutable
+                auto send_signed = [self, op, body = std::move(body), response = std::move(response),
+                                    options, linked, idempotent, done = std::move(done)](
+                                       Result<std::shared_ptr<CredentialLease>> acquired
+                                    ) mutable
                 {
                     if (!acquired) { auto error = acquired.error(); error.operation = op; done(std::move(error)); return; }
                     auto lease = std::move(acquired.value());
                     std::string envelope;
-                    try { envelope = soap_envelope(op, "", lease.get()); }
+                    try { envelope = soap_envelope(op, body, lease.get(), self->clock_->offset()); }
                     catch (const std::exception& error)
                     { done(Error{ErrorCategory::internal, op, error.what()}); return; }
                     HttpRequest q{
@@ -531,7 +558,7 @@ namespace wlonvif
                     q.credential_lease = std::move(lease);
                     q.original_url = self->url_;
                     q.operation = op;
-                    q.idempotent = true;
+                    q.idempotent = idempotent;
                     q.retry_allowed = false;
                     auto source = self->transport_->send(std::move(q), linked);
                     std::move(source).start(
@@ -546,72 +573,34 @@ namespace wlonvif
                             done(std::move(e));
                             return;
                         }
-                        if (r.value().status == 401)
-                        {
-                            Error error{ErrorCategory::authentication, op, "authentication failed"};
-                            error.http = HttpErrorDetail{r.value().status};
-                            done(std::move(error));
-                            return;
-                        }
-                        if (r.value().status == 403)
-                        {
-                            Error error{ErrorCategory::authorization, op, "request was forbidden"};
-                            error.http = HttpErrorDetail{r.value().status};
-                            done(std::move(error));
-                            return;
-                        }
-                        if (r.value().status == 429)
-                        {
-                            Error error{ErrorCategory::rate_limited, op, "HTTP rate limit exceeded", true};
-                            error.http = HttpErrorDetail{r.value().status};
-                            done(std::move(error));
-                            return;
-                        }
-                        if (r.value().status < 200 || r.value().status >= 300)
-                        {
-                            auto fault = read_soap_operation(r.value().body, response);
-                            if (!fault && (fault.error().category == ErrorCategory::soap_fault ||
-                                           fault.error().category == ErrorCategory::authentication))
-                            {
-                                auto error = fault.error();
-                                error.operation = op;
-                                done(std::move(error));
-                                return;
-                            }
-                            Error error{
-                                    ErrorCategory::protocol_violation,
-                                    op,
-                                    "unexpected HTTP status " +
-                                        std::to_string(r.value().status)
-                            };
-                            error.http = HttpErrorDetail{r.value().status};
-                            done(std::move(error));
-                            return;
-                        }
-                        auto parsed = read_soap_operation(r.value().body, response);
-                        if (!parsed)
-                        {
-                            auto e = parsed.error();
-                            e.operation = op;
-                            done(std::move(e));
-                            return;
-                        }
                         // Hand the decoders only the response element's own content.
                         // Searching the whole envelope would let a SOAP Header, or
                         // anything following the response, shadow the real fields.
-                        const auto element =
-                            detail_xml::find_element(r.value().body, response);
-                        if (!element)
-                        {
-                            done(Error{
-                                ErrorCategory::protocol_violation,
-                                op,
-                                "Expected SOAP response element missing"
-                            });
-                            return;
-                        }
-                        done(std::string(detail_xml::inner(r.value().body, *element)));
+                        done(detail::soap_response_content(r.value(), response, op));
                     }
+                    );
+                };
+                auto send_with = [self, options, linked, send_signed = std::move(send_signed)](
+                                     Result<std::shared_ptr<CredentialLease>> acquired
+                                 ) mutable
+                {
+                    // Measure the device clock before the first signed request so
+                    // the UsernameToken Created timestamp is in device time.
+                    if (!acquired || !acquired.value() || !self->clock_->needs_measurement())
+                    {
+                        send_signed(std::move(acquired));
+                        return;
+                    }
+                    auto measurement = self->transport_->send(
+                        detail::clock_request(self->url_, options.deadline), linked
+                    );
+                    std::move(measurement).start(
+                        [self, acquired = std::move(acquired),
+                         send_signed = std::move(send_signed)](Result<HttpResponse> r) mutable
+                        {
+                            self->clock_->record(r, std::chrono::system_clock::now());
+                            send_signed(std::move(acquired));
+                        }
                     );
                 };
                 if (!self->credential_provider_)
@@ -650,49 +639,7 @@ namespace wlonvif
     {
         return decoded<SystemDateAndTime>(
             invoke(OperationId::get_system_date_and_time, "GetSystemDateAndTimeResponse", o),
-            [](auto& x) -> Result<SystemDateAndTime>
-            {
-                const auto invalid = [](std::string message)
-                {
-                    return Error{
-                        ErrorCategory::protocol_violation,
-                        OperationId::get_system_date_and_time,
-                        std::move(message)
-                    };
-                };
-                // The response also carries LocalDateTime with identically named
-                // children, so the UTC subtree has to be selected explicitly rather
-                // than taking whichever Year element happens to appear first.
-                const auto utc = detail_xml::find_element(x, "UTCDateTime");
-                if (!utc)
-                {
-                    return invalid("device did not report a UTC date and time");
-                }
-                const auto subtree = std::string(detail_xml::inner(x, *utc));
-                const auto integer = [&](std::string_view name)
-                {
-                    const auto value = field(subtree, name);
-                    return value.empty() ? -1 : std::atoi(value.c_str());
-                };
-                const auto year = integer("Year");
-                const auto month = integer("Month");
-                const auto day = integer("Day");
-                const auto hour = integer("Hour");
-                const auto minute = integer("Minute");
-                const auto second = integer("Second");
-                const auto date = std::chrono::year(year) /
-                                  std::chrono::month(static_cast<unsigned>(month)) /
-                                  std::chrono::day(static_cast<unsigned>(day));
-                if (!date.ok() || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
-                    second < 0 || second > 60)
-                {
-                    return invalid("device reported an invalid UTC date and time");
-                }
-                return SystemDateAndTime{
-                    std::chrono::sys_days(date) + std::chrono::hours(hour) +
-                    std::chrono::minutes(minute) + std::chrono::seconds(second)
-                };
-            }
+            [](auto& x) { return detail::decode_system_date_and_time(x); }
         );
     }
     Task<Result<std::vector<std::string>>> DeviceSession::get_scopes(CallOptions o)
@@ -712,6 +659,441 @@ namespace wlonvif
                 );
                 return v;
             }
+        );
+    }
+    namespace
+    {
+        template <class T> Task<Result<T>> failed(Error error)
+        {
+            return Task<Result<T>>([error = std::move(error)](auto done) mutable
+            {
+                done(std::move(error));
+            });
+        }
+
+        Error invalid_argument(OperationId operation, std::string message)
+        {
+            return Error{ErrorCategory::invalid_argument, operation, std::move(message)};
+        }
+
+        /// Serialize scope URIs as @p element children, rejecting unusable values.
+        Result<std::string> scope_elements(
+            const std::vector<std::string>& scopes, std::string_view element, OperationId operation
+        )
+        {
+            if (scopes.empty()) return invalid_argument(operation, "no scopes given");
+            std::string output;
+            for (const auto& scope : scopes)
+            {
+                // Discovery advertises scopes as one whitespace-separated list, so a
+                // scope containing whitespace would read back as several scopes.
+                if (scope.empty() ||
+                    std::any_of(scope.begin(), scope.end(),
+                                [](unsigned char c) { return std::isspace(c) || std::iscntrl(c); }))
+                {
+                    return invalid_argument(
+                        operation, "scope URIs must be non-empty and contain no whitespace"
+                    );
+                }
+                output += "<tds:" + std::string(element) + '>' + detail_xml::escape(scope) +
+                          "</tds:" + std::string(element) + '>';
+            }
+            return output;
+        }
+
+        std::string number_element(std::string_view name, long long value)
+        {
+            return "<tt:" + std::string(name) + '>' + std::to_string(value) + "</tt:" +
+                   std::string(name) + '>';
+        }
+
+        std::string utc_date_time(std::chrono::system_clock::time_point value)
+        {
+            const auto seconds = std::chrono::floor<std::chrono::seconds>(value);
+            const auto day = std::chrono::floor<std::chrono::days>(seconds);
+            const std::chrono::year_month_day date{day};
+            const std::chrono::hh_mm_ss time{seconds - day};
+            return "<tds:UTCDateTime><tt:Time>" + number_element("Hour", time.hours().count()) +
+                   number_element("Minute", time.minutes().count()) +
+                   number_element("Second", time.seconds().count()) + "</tt:Time><tt:Date>" +
+                   number_element("Year", static_cast<int>(date.year())) +
+                   number_element("Month", static_cast<unsigned>(date.month())) +
+                   number_element("Day", static_cast<unsigned>(date.day())) +
+                   "</tt:Date></tds:UTCDateTime>";
+        }
+
+        /// Serialize an NTP server as a tt:NetworkHost of the matching type.
+        std::string network_host(const std::string& host)
+        {
+            const bool ipv6 = host.find(':') != std::string::npos;
+            const bool ipv4 = !ipv6 && std::count(host.begin(), host.end(), '.') == 3 &&
+                              std::all_of(host.begin(), host.end(), [](unsigned char c)
+                                          { return std::isdigit(c) || c == '.'; });
+            const std::string_view type = ipv6 ? "IPv6" : ipv4 ? "IPv4" : "DNS";
+            const std::string_view element = ipv6 ? "IPv6Address" : ipv4 ? "IPv4Address" : "DNSname";
+            return "<tds:NTPManual><tt:Type>" + std::string(type) + "</tt:Type><tt:" +
+                   std::string(element) + '>' + detail_xml::escape(host) + "</tt:" +
+                   std::string(element) + "></tds:NTPManual>";
+        }
+
+        /// Read the address of every NetworkHost element named @p name.
+        std::vector<std::string> network_hosts(std::string_view xml, std::string_view name)
+        {
+            std::vector<std::string> output;
+            detail_xml::for_each_element(
+                xml,
+                name,
+                [&](const detail_xml::Element& element)
+                {
+                    const auto host = std::string(detail_xml::inner(xml, element));
+                    for (const auto field : {"DNSname", "IPv4Address", "IPv6Address"})
+                    {
+                        auto value = detail_xml::first_text(host, field);
+                        if (!value.empty())
+                        {
+                            output.push_back(std::move(value));
+                            break;
+                        }
+                    }
+                }
+            );
+            return output;
+        }
+    } // namespace
+    Task<Result<std::vector<ScopeEntry>>> DeviceSession::get_scope_entries(CallOptions o)
+    {
+        return decoded<std::vector<ScopeEntry>>(
+            invoke(OperationId::get_scopes, "GetScopesResponse", o),
+            [](auto& x)
+            {
+                std::vector<ScopeEntry> entries;
+                detail_xml::for_each_element(
+                    x,
+                    "Scopes",
+                    [&](const detail_xml::Element& element)
+                    {
+                        const auto scope = std::string(detail_xml::inner(x, element));
+                        ScopeEntry entry;
+                        entry.uri = field(scope, "ScopeItem");
+                        entry.definition = field(scope, "ScopeDef") == "Configurable"
+                                               ? ScopeDefinition::configurable
+                                               : ScopeDefinition::fixed;
+                        if (!entry.uri.empty()) entries.push_back(std::move(entry));
+                    }
+                );
+                return entries;
+            }
+        );
+    }
+    Task<Result<void>> DeviceSession::set_scopes(std::vector<std::string> scopes, CallOptions o)
+    {
+        auto body = scope_elements(scopes, "Scopes", OperationId::set_scopes);
+        if (!body) return failed<void>(body.error());
+        return decoded<void>(
+            invoke(OperationId::set_scopes, std::move(body.value()), "SetScopesResponse", o, true),
+            [](auto&) { return Result<void>{}; }
+        );
+    }
+    Task<Result<void>> DeviceSession::add_scopes(std::vector<std::string> scopes, CallOptions o)
+    {
+        auto body = scope_elements(scopes, "ScopeItem", OperationId::add_scopes);
+        if (!body) return failed<void>(body.error());
+        return decoded<void>(
+            invoke(OperationId::add_scopes, std::move(body.value()), "AddScopesResponse", o, false),
+            [](auto&) { return Result<void>{}; }
+        );
+    }
+    Task<Result<void>> DeviceSession::remove_scopes(std::vector<std::string> scopes, CallOptions o)
+    {
+        auto body = scope_elements(scopes, "ScopeItem", OperationId::remove_scopes);
+        if (!body) return failed<void>(body.error());
+        return decoded<void>(
+            invoke(
+                OperationId::remove_scopes, std::move(body.value()), "RemoveScopesResponse", o, false
+            ),
+            [](auto&) { return Result<void>{}; }
+        );
+    }
+    Task<Result<void>> DeviceSession::set_system_date_and_time(
+        SystemDateAndTimeSettings settings, CallOptions o
+    )
+    {
+        constexpr auto operation = OperationId::set_system_date_and_time;
+        const bool manual = settings.type == DateTimeType::manual;
+        if (manual != settings.utc.has_value())
+        {
+            return failed<void>(invalid_argument(
+                operation, manual ? "manual time requires a UTC time"
+                                  : "a UTC time can only be set with manual time"
+            ));
+        }
+        if (settings.time_zone &&
+            (settings.time_zone->empty() ||
+             std::any_of(settings.time_zone->begin(), settings.time_zone->end(),
+                         [](unsigned char c) { return std::iscntrl(c) || std::isspace(c); })))
+        {
+            return failed<void>(invalid_argument(operation, "time zone must be a POSIX TZ string"));
+        }
+        std::string body = std::string("<tds:DateTimeType>") + (manual ? "Manual" : "NTP") +
+                           "</tds:DateTimeType><tds:DaylightSavings>" +
+                           (settings.daylight_savings ? "true" : "false") +
+                           "</tds:DaylightSavings>";
+        if (settings.time_zone)
+        {
+            body += "<tds:TimeZone><tt:TZ>" + detail_xml::escape(*settings.time_zone) +
+                    "</tt:TZ></tds:TimeZone>";
+        }
+        if (settings.utc) body += utc_date_time(*settings.utc);
+        return decoded<void>(
+            invoke(operation, std::move(body), "SetSystemDateAndTimeResponse", o, true),
+            [self = shared_from_this()](auto&)
+            {
+                // Signed requests are stamped in device time; it has just moved.
+                self->clock_->invalidate();
+                return Result<void>{};
+            }
+        );
+    }
+    Task<Result<NtpConfiguration>> DeviceSession::get_ntp(CallOptions o)
+    {
+        return decoded<NtpConfiguration>(
+            invoke(OperationId::get_ntp, "GetNTPResponse", o),
+            [](auto& x)
+            {
+                NtpConfiguration configuration;
+                configuration.from_dhcp = field(x, "FromDHCP") == "true";
+                configuration.servers = network_hosts(x, "NTPManual");
+                configuration.dhcp_servers = network_hosts(x, "NTPFromDHCP");
+                return configuration;
+            }
+        );
+    }
+    Task<Result<void>> DeviceSession::set_ntp(NtpConfiguration configuration, CallOptions o)
+    {
+        constexpr auto operation = OperationId::set_ntp;
+        if (configuration.from_dhcp != configuration.servers.empty())
+        {
+            return failed<void>(invalid_argument(
+                operation, configuration.from_dhcp
+                               ? "servers cannot be configured while using DHCP"
+                               : "at least one NTP server is required without DHCP"
+            ));
+        }
+        std::string body = std::string("<tds:FromDHCP>") +
+                           (configuration.from_dhcp ? "true" : "false") + "</tds:FromDHCP>";
+        for (const auto& server : configuration.servers)
+        {
+            if (server.empty() ||
+                std::any_of(server.begin(), server.end(),
+                            [](unsigned char c) { return std::isspace(c) || std::iscntrl(c); }))
+            {
+                return failed<void>(invalid_argument(operation, "invalid NTP server: " + server));
+            }
+            body += network_host(server);
+        }
+        return decoded<void>(
+            invoke(operation, std::move(body), "SetNTPResponse", o, true),
+            [](auto&) { return Result<void>{}; }
+        );
+    }
+    Task<Result<HostnameInformation>> DeviceSession::get_hostname(CallOptions o)
+    {
+        return decoded<HostnameInformation>(
+            invoke(OperationId::get_hostname, "GetHostnameResponse", o),
+            [](auto& x)
+            {
+                return HostnameInformation{field(x, "FromDHCP") == "true", field(x, "Name")};
+            }
+        );
+    }
+    Task<Result<void>> DeviceSession::set_hostname(std::string name, CallOptions o)
+    {
+        constexpr auto operation = OperationId::set_hostname;
+        // RFC 1123: dot-separated labels of letters, digits, and inner hyphens.
+        bool valid = !name.empty() && name.size() <= 253;
+        std::size_t label = 0;
+        for (std::size_t index = 0; valid && index <= name.size(); ++index)
+        {
+            const char c = index < name.size() ? name[index] : '.';
+            if (c == '.')
+            {
+                valid = label > 0 && label <= 63 && name[index - 1] != '-';
+                label = 0;
+            }
+            else
+            {
+                valid = std::isalnum(static_cast<unsigned char>(c)) || (c == '-' && label > 0);
+                ++label;
+            }
+        }
+        if (!valid) return failed<void>(invalid_argument(operation, "invalid hostname: " + name));
+        return decoded<void>(
+            invoke(operation, "<tds:Name>" + name + "</tds:Name>", "SetHostnameResponse", o, true),
+            [](auto&) { return Result<void>{}; }
+        );
+    }
+    Task<Result<std::vector<NetworkInterface>>> DeviceSession::get_network_interfaces(CallOptions o)
+    {
+        return decoded<std::vector<NetworkInterface>>(
+            invoke(OperationId::get_network_interfaces, "GetNetworkInterfacesResponse", o),
+            [](auto& x)
+            {
+                std::vector<NetworkInterface> output;
+                detail_xml::for_each_element(
+                    x,
+                    "NetworkInterfaces",
+                    [&](const detail_xml::Element& element)
+                    {
+                        const auto body = std::string(detail_xml::inner(x, element));
+                        NetworkInterface item;
+                        item.token = detail_xml::attribute(detail_xml::attributes(x, element), "token");
+                        item.enabled = field(body, "Enabled") == "true";
+                        if (const auto info = detail_xml::find_element(body, "Info"))
+                        {
+                            const auto content = std::string(detail_xml::inner(body, *info));
+                            item.name = field(content, "Name");
+                            item.hardware_address = field(content, "HwAddress");
+                            item.mtu = std::atoi(field(content, "MTU").c_str());
+                        }
+                        if (const auto ipv4 = detail_xml::find_element(body, "IPv4"))
+                        {
+                            const auto content = std::string(detail_xml::inner(body, *ipv4));
+                            item.ipv4_enabled = field(content, "Enabled") == "true";
+                            item.ipv4_dhcp = field(content, "DHCP") == "true";
+                            // Manual, LinkLocal, and FromDHCP all hold Address/PrefixLength.
+                            for (const auto kind : {"Manual", "LinkLocal", "FromDHCP"})
+                                detail_xml::for_each_element(
+                                    content, kind,
+                                    [&](const detail_xml::Element& address)
+                                    {
+                                        const auto entry = std::string(detail_xml::inner(content, address));
+                                        const auto value = field(entry, "Address");
+                                        if (value.empty()) return;
+                                        const auto prefix = field(entry, "PrefixLength");
+                                        item.ipv4_addresses.push_back(prefix.empty() ? value : value + "/" + prefix);
+                                    }
+                                );
+                        }
+                        output.push_back(std::move(item));
+                    }
+                );
+                return output;
+            }
+        );
+    }
+    Task<Result<DnsInformation>> DeviceSession::get_dns(CallOptions o)
+    {
+        return decoded<DnsInformation>(
+            invoke(OperationId::get_dns, "GetDNSResponse", o),
+            [](auto& x)
+            {
+                DnsInformation output;
+                output.from_dhcp = field(x, "FromDHCP") == "true";
+                detail_xml::for_each_element(
+                    x, "SearchDomain",
+                    [&](const detail_xml::Element& domain) { output.search_domains.push_back(detail_xml::text(x, domain)); }
+                );
+                output.servers = network_hosts(x, "DNSManual");
+                output.dhcp_servers = network_hosts(x, "DNSFromDHCP");
+                return output;
+            }
+        );
+    }
+    Task<Result<std::vector<std::string>>> DeviceSession::get_network_default_gateway(CallOptions o)
+    {
+        return decoded<std::vector<std::string>>(
+            invoke(OperationId::get_network_default_gateway, "GetNetworkDefaultGatewayResponse", o),
+            [](auto& x)
+            {
+                std::vector<std::string> output;
+                for (const auto kind : {"IPv4Address", "IPv6Address"})
+                    detail_xml::for_each_element(
+                        x, kind,
+                        [&](const detail_xml::Element& address)
+                        {
+                            auto value = detail_xml::text(x, address);
+                            if (!value.empty()) output.push_back(std::move(value));
+                        }
+                    );
+                return output;
+            }
+        );
+    }
+    Task<Result<std::vector<NetworkProtocol>>> DeviceSession::get_network_protocols(CallOptions o)
+    {
+        return decoded<std::vector<NetworkProtocol>>(
+            invoke(OperationId::get_network_protocols, "GetNetworkProtocolsResponse", o),
+            [](auto& x)
+            {
+                std::vector<NetworkProtocol> output;
+                detail_xml::for_each_element(
+                    x, "NetworkProtocols",
+                    [&](const detail_xml::Element& element)
+                    {
+                        const auto body = std::string(detail_xml::inner(x, element));
+                        NetworkProtocol protocol{field(body, "Name"), field(body, "Enabled") == "true", {}};
+                        detail_xml::for_each_element(
+                            body, "Port",
+                            [&](const detail_xml::Element& port)
+                            { protocol.ports.push_back(std::atoi(detail_xml::text(body, port).c_str())); }
+                        );
+                        output.push_back(std::move(protocol));
+                    }
+                );
+                return output;
+            }
+        );
+    }
+    Task<Result<DiscoveryMode>> DeviceSession::get_discovery_mode(CallOptions o)
+    {
+        return decoded<DiscoveryMode>(
+            invoke(OperationId::get_discovery_mode, "GetDiscoveryModeResponse", o),
+            [](auto& x) -> Result<DiscoveryMode>
+            {
+                const auto mode = field(x, "DiscoveryMode");
+                if (mode == "Discoverable") return DiscoveryMode::discoverable;
+                if (mode == "NonDiscoverable") return DiscoveryMode::non_discoverable;
+                return Error{ErrorCategory::protocol_violation, OperationId::get_discovery_mode,
+                             "unknown discovery mode: " + mode};
+            }
+        );
+    }
+    Task<Result<void>> DeviceSession::set_discovery_mode(DiscoveryMode mode, CallOptions o)
+    {
+        return decoded<void>(
+            invoke(OperationId::set_discovery_mode,
+                   std::string("<tds:DiscoveryMode>") +
+                       (mode == DiscoveryMode::discoverable ? "Discoverable" : "NonDiscoverable") +
+                       "</tds:DiscoveryMode>",
+                   "SetDiscoveryModeResponse", o, true),
+            [](auto&) { return Result<void>{}; }
+        );
+    }
+    Task<Result<std::vector<DeviceUser>>> DeviceSession::get_users(CallOptions o)
+    {
+        return decoded<std::vector<DeviceUser>>(
+            invoke(OperationId::get_users, "GetUsersResponse", o),
+            [](auto& x)
+            {
+                std::vector<DeviceUser> output;
+                detail_xml::for_each_element(
+                    x, "User",
+                    [&](const detail_xml::Element& element)
+                    {
+                        const auto body = std::string(detail_xml::inner(x, element));
+                        output.push_back({field(body, "Username"), field(body, "UserLevel")});
+                    }
+                );
+                return output;
+            }
+        );
+    }
+    Task<Result<std::string>> DeviceSession::system_reboot(CallOptions o)
+    {
+        // Not idempotent: a repeated request could restart the device twice.
+        return decoded<std::string>(
+            invoke(OperationId::system_reboot, {}, "SystemRebootResponse", o, false),
+            [](auto& x) { return field(x, "Message"); }
         );
     }
     Task<Result<std::vector<Service>>> DeviceSession::get_services(CallOptions o)
@@ -763,6 +1145,8 @@ namespace wlonvif
                 c.media_xaddr = endpoint("Media");
                 c.ptz_xaddr = endpoint("PTZ");
                 c.events_xaddr = endpoint("Events");
+                c.analytics_xaddr = endpoint("Analytics");
+                c.imaging_xaddr = endpoint("Imaging");
                 return c;
             }
         );
@@ -786,7 +1170,7 @@ namespace wlonvif
         {
             backend_ = make_network_service_backend(
                 url_, transport_, endpoint_policy_, runtime_, credential_provider_,
-                session_cancellation_.token()
+                session_cancellation_.token(), clock_
             );
         }
         return backend_;
@@ -815,7 +1199,7 @@ namespace wlonvif
             if (!backend_)
                 backend_ = make_network_service_backend(
                     url_, transport_, endpoint_policy_, runtime_, credential_provider_,
-                    session_cancellation_.token()
+                    session_cancellation_.token(), clock_
                 );
         }
         if (!ptz_safety_)
@@ -823,6 +1207,16 @@ namespace wlonvif
                 backend_, session_cancellation_.token()
             );
         return ptz_safety_;
+    }
+    Result<std::shared_ptr<AnalyticsClient>> DeviceSession::analytics()
+    {
+        if (is_closed()) return Error{ErrorCategory::closed_handle, {}, "session is closed"};
+        return std::make_shared<AnalyticsClient>(runtime_, backend());
+    }
+    Result<std::shared_ptr<ImagingClient>> DeviceSession::imaging()
+    {
+        if (is_closed()) return Error{ErrorCategory::closed_handle, {}, "session is closed"};
+        return std::make_shared<ImagingClient>(runtime_, backend());
     }
     Result<std::shared_ptr<ManagedEventStream>> DeviceSession::events(std::size_t maximum)
     {

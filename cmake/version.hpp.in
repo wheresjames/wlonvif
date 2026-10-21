@@ -1,0 +1,11 @@
+#pragma once
+
+/**
+ * @file version.hpp
+ * @brief Generated from PROJECT.txt at configure time. Do not edit.
+ */
+
+#define WLONVIF_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define WLONVIF_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define WLONVIF_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define WLONVIF_VERSION_STRING "@PROJECT_VERSION@"

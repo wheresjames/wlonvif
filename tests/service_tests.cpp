@@ -148,7 +148,7 @@ int main()
         runtime, DeviceInformation{}, std::vector<std::string>{}, std::vector<Service>{}, caps
     );
     device->add_profile(
-        {"main", "Main"},
+        {"main", "Main", {}},
         {"rtsp://camera/main", std::chrono::seconds(60), false},
         {"http://camera/snapshot", std::chrono::seconds(30), false},
         {{-2, 2}, {-1, 3}, {0, 1}}

@@ -84,7 +84,7 @@ int main()
         Capabilities{}
     );
     device->add_profile(
-        {"main", "Main"}, MediaUri{"rtsp://camera/main", {}, false},
+        {"main", "Main", {}}, MediaUri{"rtsp://camera/main", {}, false},
         MediaUri{"http://camera/snapshot", {}, false}, PtzSpaces{{-1, 1}, {-1, 1}, {-1, 1}}
     );
     auto client = std::make_shared<PtzClient>(runtime, device);

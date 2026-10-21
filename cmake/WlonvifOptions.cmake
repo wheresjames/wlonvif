@@ -14,6 +14,7 @@ option(WLONVIF_WARNINGS_AS_ERRORS "Treat project warnings as errors" OFF)
 option(WLONVIF_BUILD_PTZ_DEPENDENCY_SPIKES "Build optional SDL3 and Beast PTZ acceptance probes" OFF)
 option(WLONVIF_BUILD_PTZ_CONTROL "Build the optional SDL3 native PTZ controller example" OFF)
 option(WLONVIF_BUILD_PTZ_WEB "Build the optional secure browser PTZ controller example" OFF)
+option(WLONVIF_BUILD_EXPLORER "Build the optional browser camera explorer example" OFF)
 option(WLONVIF_FETCH_PTZ_DEPENDENCIES "Fetch pinned optional PTZ example dependencies" OFF)
 
 # The convenience build is deterministic: unsupported compiler-specific targets are skipped.
@@ -24,6 +25,8 @@ if(WLONVIF_BUILD_EVERYTHING)
     "Build the optional SDL3 native PTZ controller example" FORCE)
   set(WLONVIF_BUILD_PTZ_WEB ON CACHE BOOL
     "Build the optional secure browser PTZ controller example" FORCE)
+  set(WLONVIF_BUILD_EXPLORER ON CACHE BOOL
+    "Build the optional browser camera explorer example" FORCE)
   set(WLONVIF_BUILD_DOCS ON CACHE BOOL "Build Doxygen API documentation" FORCE)
   set(WLONVIF_INSTALL_DOCS ON CACHE BOOL "Install generated API documentation" FORCE)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <limits>
@@ -126,6 +127,13 @@ namespace wlonvif
             }
             return false;
         }
+        bool is_ip_literal(const std::string& host)
+        {
+            in_addr v4{};
+            in6_addr v6{};
+            return inet_pton(AF_INET, host.c_str(), &v4) == 1 ||
+                   inet_pton(AF_INET6, host.c_str(), &v6) == 1;
+        }
         Result<std::vector<std::string>> resolve_host(
             std::string host,
             std::string port,
@@ -251,9 +259,20 @@ namespace wlonvif
                                         detail::dispatch(rt, [done = std::move(done)]() mutable { done(Error{ErrorCategory::invalid_argument, {}, "HTTP URL has an invalid port"}); });
                                         return;
                                     }
-                                    auto resolved = resolve_host(
-                                        host_value, port_value, req.deadline, token
-                                    );
+                                    // libcurl reports IPv6 literals in brackets, which
+                                    // getaddrinfo rejects. A literal needs no lookup
+                                    // at all: it is already the address, and it cannot
+                                    // be rebound, so it is authorized as-is and needs
+                                    // no CURLOPT_RESOLVE pin.
+                                    std::string lookup_host = host_value;
+                                    if (lookup_host.size() > 2 && lookup_host.front() == '[' &&
+                                        lookup_host.back() == ']')
+                                        lookup_host = lookup_host.substr(1, lookup_host.size() - 2);
+                                    const bool literal = is_ip_literal(lookup_host);
+                                    auto resolved = literal
+                                        ? Result<std::vector<std::string>>(
+                                              std::vector<std::string>{lookup_host})
+                                        : resolve_host(lookup_host, port_value, req.deadline, token);
                                     if (!resolved)
                                     {
                                         curl_free(host_value); curl_free(port_value); curl_url_cleanup(parsed);
@@ -267,7 +286,7 @@ namespace wlonvif
                                     request.original_url = req.original_url.empty()
                                         ? req.url : req.original_url;
                                     request.effective_url = req.url;
-                                    request.hostname = lowercase(host_value);
+                                    request.hostname = lowercase(lookup_host);
                                     request.port = static_cast<std::uint16_t>(parsed_port);
                                     request.resolved_addresses = addresses;
                                     request.proposed_address = addresses.front();
@@ -282,8 +301,12 @@ namespace wlonvif
                                     auto task = authorizer->authorize(request, {req.deadline, token});
                                     std::move(task).start([approval](Result<void> value) { std::lock_guard lock(approval->mutex); approval->result.emplace(std::move(value)); approval->cv.notify_one(); });
                                     std::unique_lock lock(approval->mutex);
+                                    // Cancellation cannot notify this condition variable,
+                                    // so the wait is sliced to notice it promptly.
                                     while (!approval->result && !token.stop_requested() && std::chrono::steady_clock::now() < req.deadline)
-                                        approval->cv.wait_until(lock, req.deadline);
+                                        approval->cv.wait_until(lock, std::min(
+                                            req.deadline,
+                                            std::chrono::steady_clock::now() + std::chrono::milliseconds(20)));
                                     Result<void> authorized = token.stop_requested()
                                         ? Result<void>(Error{ErrorCategory::cancelled})
                                         : !approval->result ? Result<void>(Error{ErrorCategory::timeout})
@@ -300,10 +323,13 @@ namespace wlonvif
                                         detail::dispatch(rt, [done = std::move(done), error = std::move(error)]() mutable { done(std::move(error)); });
                                         return;
                                     }
-                                    std::string pin = std::string(host_value) + ':' + port_value + ':';
-                                    if (addresses.front().find(':') != std::string::npos) pin += '[' + addresses.front() + ']';
-                                    else pin += addresses.front();
-                                    pinned = curl_slist_append(nullptr, pin.c_str());
+                                    if (!literal)
+                                    {
+                                        std::string pin = std::string(host_value) + ':' + port_value + ':';
+                                        if (addresses.front().find(':') != std::string::npos) pin += '[' + addresses.front() + ']';
+                                        else pin += addresses.front();
+                                        pinned = curl_slist_append(nullptr, pin.c_str());
+                                    }
                                     curl_free(host_value); curl_free(port_value); curl_url_cleanup(parsed);
                                 }
                                 CURL* c = curl_easy_init();
@@ -329,6 +355,10 @@ namespace wlonvif
                                     hs = curl_slist_append(hs, h.c_str());
                                 }
                                 curl_easy_setopt(c, CURLOPT_URL, req.url.c_str());
+                                // Every transfer runs on its own thread. Without this,
+                                // a libcurl built with the synchronous resolver uses
+                                // SIGALRM for DNS timeouts, which is unsafe here.
+                                curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
                                 if (pinned) curl_easy_setopt(c, CURLOPT_RESOLVE, pinned);
                                 if (req.method == HttpMethod::get)
                                 {
@@ -357,15 +387,16 @@ namespace wlonvif
                                 HeaderContext header_context;
                                 curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, header_cb);
                                 curl_easy_setopt(c, CURLOPT_HEADERDATA, &header_context);
-                                auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                req.deadline - std::chrono::steady_clock::now()
-                                )
-                                                .count();
-                                curl_easy_setopt(
-                                    c, CURLOPT_TIMEOUT_MS, static_cast<long>(left > 0 ? left : 1)
-                                );
+                                // The timeout is recomputed for every attempt. Setting it
+                                // once would give the authenticated retry a fresh full
+                                // budget, letting the request run to twice its deadline.
                                 const auto perform = [&]
                                 {
+                                    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        req.deadline - std::chrono::steady_clock::now()
+                                    ).count();
+                                    if (left <= 0) return CURLE_OPERATION_TIMEDOUT;
+                                    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, static_cast<long>(left));
                                     response.body.clear();
                                     write_context.exceeded = false;
                                     header_context.challenge.clear();

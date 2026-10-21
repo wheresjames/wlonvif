@@ -77,9 +77,15 @@ namespace wlonvif
                 state->ready.notify_one();
             });
             std::unique_lock lock(state->mutex);
+            // Cancellation cannot notify this condition variable, so the wait is
+            // sliced; waiting straight to the deadline would ignore cancellation.
             while (!state->result && !cancellation.stop_requested() &&
                    std::chrono::steady_clock::now() < deadline)
-                state->ready.wait_until(lock, deadline);
+                state->ready.wait_until(
+                    lock,
+                    std::min(deadline, std::chrono::steady_clock::now() +
+                                           std::chrono::milliseconds(20))
+                );
             if (cancellation.stop_requested()) return Error{ErrorCategory::cancelled};
             if (!state->result) return Error{ErrorCategory::timeout};
             auto result = std::move(*state->result);
@@ -446,21 +452,34 @@ namespace wlonvif
             }
             auto interfaces =
                 options.interfaces.empty() ? interface_addresses() : options.interfaces;
+            // Each interface waits a full listen window, so interfaces are listened
+            // to concurrently; serially, hosts with several interfaces (container
+            // bridges, VPNs) spent the whole deadline here before direct probing.
+            // Authorization stays on this thread so the authorizer is never
+            // invoked concurrently.
+            std::mutex progress_mutex;
+            std::size_t interfaces_completed = 0;
+            std::vector<std::map<std::string, DeviceCandidate>> found(interfaces.size());
+            std::vector<std::jthread> listeners;
+            listeners.reserve(interfaces.size());
             for (std::size_t interface_index = 0; interface_index < interfaces.size();
                  ++interface_index)
             {
                 const auto& interface_address = interfaces[interface_index];
                 if (cancellation.stop_requested() || std::chrono::steady_clock::now() >= deadline)
                 {
-                    return {};
+                    break;
                 }
-                report_progress(
-                    options,
-                    DiscoveryProgressStage::ws_discovery,
-                    interface_index,
-                    interfaces.size(),
-                    interface_address
-                );
+                {
+                    std::lock_guard lock(progress_mutex);
+                    report_progress(
+                        options,
+                        DiscoveryProgressStage::ws_discovery,
+                        interfaces_completed,
+                        interfaces.size(),
+                        interface_address
+                    );
+                }
                 auto bind_authorized = authorize_discovery(
                     options,
                     {DiscoveryNetworkAction::bind_udp, interface_address, {}, 0, {}},
@@ -519,71 +538,92 @@ namespace wlonvif
                     close_socket(socket);
                     continue;
                 }
-                std::vector<std::pair<DiscoveryProbeType, std::string>> probes;
-                for (auto type : options.probe_types)
-                {
-                    probes.emplace_back(type, random_message_id());
-                }
-                for (std::size_t retry = 0;
-                     retry < options.retransmissions && !cancellation.stop_requested() &&
-                     std::chrono::steady_clock::now() < deadline;
-                     ++retry)
-                {
-                    for (const auto& [type, message_id] : probes)
+                listeners.emplace_back(
+                    [&, interface_index, socket, destinations = std::move(destinations)]
                     {
-                        const auto probe = probe_xml(message_id, type);
-                        for (const auto& destination : destinations)
+                    const auto& interface_address = interfaces[interface_index];
+                    std::vector<std::pair<DiscoveryProbeType, std::string>> probes;
+                    for (auto type : options.probe_types)
+                    {
+                        probes.emplace_back(type, random_message_id());
+                    }
+                    for (std::size_t retry = 0;
+                         retry < options.retransmissions && !cancellation.stop_requested() &&
+                         std::chrono::steady_clock::now() < deadline;
+                         ++retry)
+                    {
+                        for (const auto& [type, message_id] : probes)
                         {
-                            (void)sendto(
-                                socket,
-                                probe.data(),
-                                static_cast<int>(probe.size()),
-                                0,
-                                reinterpret_cast<const sockaddr*>(&destination),
-                                sizeof(destination)
+                            const auto probe = probe_xml(message_id, type);
+                            for (const auto& destination : destinations)
+                            {
+                                (void)sendto(
+                                    socket,
+                                    probe.data(),
+                                    static_cast<int>(probe.size()),
+                                    0,
+                                    reinterpret_cast<const sockaddr*>(&destination),
+                                    sizeof(destination)
+                                );
+                            }
+                        }
+                        if (retry + 1 < options.retransmissions)
+                        {
+                            const auto delay = options.initial_retry_delay *
+                                               static_cast<int>(1U << std::min<std::size_t>(retry, 20));
+                            std::this_thread::sleep_for(
+                                std::min(
+                                    delay,
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        deadline - std::chrono::steady_clock::now()
+                                    )
+                                )
                             );
                         }
                     }
-                    if (retry + 1 < options.retransmissions)
-                    {
-                        const auto delay = options.initial_retry_delay *
-                                           static_cast<int>(1U << std::min<std::size_t>(retry, 20));
-                        std::this_thread::sleep_for(
-                            std::min(
-                                delay,
-                                std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    deadline - std::chrono::steady_clock::now()
-                                )
-                            )
-                        );
+                    const auto listen_end =
+                        std::min(deadline, std::chrono::steady_clock::now() + options.listen_duration);
+                    receive_matches(
+                        socket,
+                        interface_address,
+                        listen_end,
+                        cancellation,
+                        found[interface_index],
+                        options.maximum_results
+                    );
+                    close_socket(socket);
+                    std::lock_guard lock(progress_mutex);
+                    report_progress(
+                        options,
+                        DiscoveryProgressStage::ws_discovery,
+                        ++interfaces_completed,
+                        interfaces.size(),
+                        interface_address
+                    );
                     }
+                );
+            }
+            for (auto& listener : listeners)
+            {
+                listener.join();
+            }
+            for (auto& interface_candidates : found)
+            {
+                for (auto& [_, candidate] : interface_candidates)
+                {
+                    merge_candidate(candidates, std::move(candidate), options.maximum_results);
                 }
-                const auto listen_end =
-                    std::min(deadline, std::chrono::steady_clock::now() + options.listen_duration);
-                receive_matches(
-                    socket, interface_address, listen_end, cancellation, candidates, options.maximum_results
-                );
-                close_socket(socket);
-                report_progress(
-                    options,
-                    DiscoveryProgressStage::ws_discovery,
-                    interface_index + 1,
-                    interfaces.size(),
-                    interface_address
-                );
             }
             return {};
         }
 
-        Result<void> ws_unicast_discover(
+        Result<void> authorize_unicast_discovery(
             const NetworkDiscoveryOptions& options,
             std::chrono::steady_clock::time_point deadline,
-            const CancellationToken& cancellation,
-            std::map<std::string, DeviceCandidate>& candidates
+            const CancellationToken& cancellation
         )
         {
-            if (options.targets.empty() || cancellation.stop_requested() ||
-                std::chrono::steady_clock::now() >= deadline)
+            if (options.targets.empty())
             {
                 return {};
             }
@@ -604,11 +644,27 @@ namespace wlonvif
                 );
                 if (!send_authorized) return send_authorized;
             }
+            return {};
+        }
+
+        /// Send unicast Probes to every target; authorize_unicast_discovery() first.
+        void ws_unicast_discover(
+            const NetworkDiscoveryOptions& options,
+            std::chrono::steady_clock::time_point deadline,
+            const CancellationToken& cancellation,
+            std::map<std::string, DeviceCandidate>& candidates
+        )
+        {
+            if (options.targets.empty() || cancellation.stop_requested() ||
+                std::chrono::steady_clock::now() >= deadline)
+            {
+                return;
+            }
             SocketRuntime socket_runtime;
             SocketHandle socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
             if (!socket_runtime.valid() || socket == InvalidSocket)
             {
-                return {};
+                return;
             }
             sockaddr_in local{};
             local.sin_family = AF_INET;
@@ -617,7 +673,7 @@ namespace wlonvif
             if (bind(socket, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0)
             {
                 close_socket(socket);
-                return {};
+                return;
             }
             make_nonblocking(socket);
 
@@ -674,7 +730,7 @@ namespace wlonvif
                 options.maximum_results
             );
             close_socket(socket);
-            return {};
+            return;
         }
 
         Result<std::vector<std::string>>
@@ -768,7 +824,55 @@ namespace wlonvif
             return bytes;
         }
 
-        std::optional<DeviceCandidate> probe_address(
+        /// Result of directly probing one address.
+        struct ProbeOutcome
+        {
+            std::optional<DeviceCandidate> candidate;
+            /// False when the deadline or cancellation cut the probe short, so
+            /// finding nothing does not show that nothing is there.
+            bool complete{true};
+        };
+
+        /// Classify one finished probe request; nullopt when it found nothing.
+        std::optional<DeviceCandidate> classify_probe(
+            const std::string& address,
+            const std::string& url,
+            CURLcode result,
+            long status,
+            const std::string& response_body
+        )
+        {
+            const bool onvif_response =
+                response_body.find("GetSystemDateAndTimeResponse") != std::string::npos;
+            const bool soap_fault = response_body.find(":Fault") != std::string::npos ||
+                                    response_body.find("<Fault") != std::string::npos;
+            if (result != CURLE_OK ||
+                !(status == 401 || status == 403 || onvif_response || soap_fault))
+            {
+                return std::nullopt;
+            }
+            DeviceCandidate candidate;
+            candidate.address = address;
+            candidate.device_service = url;
+            if (status == 401 || status == 403)
+            {
+                candidate.evidence = DeviceEvidence::authentication_challenge;
+                candidate.diagnostic = "Device service authentication challenge";
+            }
+            else if (soap_fault)
+            {
+                candidate.evidence = DeviceEvidence::soap_fault;
+                candidate.diagnostic = "SOAP fault from Device service candidate";
+            }
+            else
+            {
+                candidate.evidence = DeviceEvidence::onvif_response;
+                candidate.diagnostic = "ONVIF Device operation response";
+            }
+            return candidate;
+        }
+
+        ProbeOutcome probe_address(
             const std::string& address,
             const std::optional<std::string>& advertised_url,
             const NetworkDiscoveryOptions& options,
@@ -800,42 +904,76 @@ namespace wlonvif
                     );
                 }
             }
+            if (cancellation.stop_requested() || std::chrono::steady_clock::now() >= deadline)
+            {
+                return {std::nullopt, false};
+            }
+            // Every URL is requested at once. Serially, an address with nothing
+            // behind it cost one full connect timeout per port, which made a
+            // range scan take several times longer than any single probe.
+            struct Request
+            {
+                std::string url;
+                CURL* curl{};
+                curl_slist* headers{};
+                std::string response_body;
+                bool connect_clipped{}; ///< Deadline shortened the connect timeout.
+                bool total_clipped{};   ///< Deadline shortened the request timeout.
+                CURLcode result{CURLE_OK};
+                bool finished{};
+            };
+            std::vector<Request> requests;
+            requests.reserve(urls.size());
             // The address under inspection is the origin the policy is evaluated
             // against. Authorizing a URL against its own origin, as this previously
             // did, makes every policy a tautology: a spoofed ProbeMatch can then
             // name any host or port and have this send a request to it.
             const std::string reference_origin = "http://" + address;
+            const auto remaining = std::max(
+                std::chrono::milliseconds(1),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now()
+                )
+            );
             for (const auto& [url, untrusted] : urls)
             {
-                if (cancellation.stop_requested() || std::chrono::steady_clock::now() >= deadline)
-                {
-                    return std::nullopt;
-                }
                 // URLs built from the caller's own address, ports, and paths carry
                 // no device input and are authorized by construction.
                 if (untrusted && !policy.authorize(url, reference_origin))
                 {
                     continue;
                 }
-                CURL* curl = curl_easy_init();
-                if (!curl)
+                Request request;
+                request.url = url;
+                request.connect_clipped = remaining < options.connect_timeout;
+                request.total_clipped = remaining < options.request_timeout;
+                requests.push_back(std::move(request));
+            }
+            CURLM* multi = curl_multi_init();
+            if (!multi)
+            {
+                return {std::nullopt, false};
+            }
+            for (auto& request : requests)
+            {
+                request.curl = curl_easy_init();
+                if (!request.curl)
                 {
+                    request.finished = true;
+                    request.result = CURLE_FAILED_INIT;
                     continue;
                 }
-                curl_slist* headers = nullptr;
-                headers = curl_slist_append(
-                    headers, "Content-Type: application/soap+xml; charset=utf-8"
+                CURL* curl = request.curl;
+                request.headers = curl_slist_append(
+                    nullptr, "Content-Type: application/soap+xml; charset=utf-8"
                 );
-                curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+                curl_easy_setopt(curl, CURLOPT_URL, request.url.c_str());
+                // Probes run on many worker threads; signal-based DNS timeouts in
+                // a synchronous-resolver libcurl build are unsafe there.
+                curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, request.headers);
                 curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
                 curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
-                const auto remaining = std::max(
-                    std::chrono::milliseconds(1),
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        deadline - std::chrono::steady_clock::now()
-                    )
-                );
                 curl_easy_setopt(
                     curl,
                     CURLOPT_CONNECTTIMEOUT_MS,
@@ -847,46 +985,73 @@ namespace wlonvif
                     static_cast<long>(std::min(options.request_timeout, remaining).count())
                 );
                 curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
-                std::string response_body;
                 curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, collect_body);
-                curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
-                const CURLcode result = curl_easy_perform(curl);
-                long status = 0;
-                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-                curl_slist_free_all(headers);
-                curl_easy_cleanup(curl);
-                const bool onvif_response =
-                    response_body.find("GetSystemDateAndTimeResponse") != std::string::npos;
-                const bool soap_fault = response_body.find(":Fault") != std::string::npos ||
-                                        response_body.find("<Fault") != std::string::npos;
-                if (result == CURLE_OK &&
-                    (status == 401 || status == 403 || onvif_response || soap_fault))
-                {
-                    DeviceCandidate candidate;
-                    candidate.address = address;
-                    candidate.device_service = url;
-                    if (status == 401 || status == 403)
-                    {
-                        candidate.evidence = DeviceEvidence::authentication_challenge;
-                        candidate.diagnostic = "Device service authentication challenge";
-                    }
-                    else if (soap_fault)
-                    {
-                        candidate.evidence = DeviceEvidence::soap_fault;
-                        candidate.diagnostic = "SOAP fault from Device service candidate";
-                    }
-                    else
-                    {
-                        candidate.evidence = DeviceEvidence::onvif_response;
-                        candidate.diagnostic = "ONVIF Device operation response";
-                    }
-                    return candidate;
-                }
+                curl_easy_setopt(curl, CURLOPT_WRITEDATA, &request.response_body);
+                curl_easy_setopt(curl, CURLOPT_PRIVATE, &request);
+                curl_multi_add_handle(multi, curl);
             }
-            return std::nullopt;
+            for (int running = 1; running > 0;)
+            {
+                if (curl_multi_perform(multi, &running) != CURLM_OK) break;
+                for (int queued = 0; CURLMsg* message = curl_multi_info_read(multi, &queued);)
+                {
+                    if (message->msg != CURLMSG_DONE) continue;
+                    Request* request = nullptr;
+                    curl_easy_getinfo(message->easy_handle, CURLINFO_PRIVATE, &request);
+                    if (request)
+                    {
+                        request->finished = true;
+                        request->result = message->data.result;
+                    }
+                }
+                if (running == 0) break;
+                // Polling in slices keeps cancellation responsive.
+                if (cancellation.stop_requested()) break;
+                (void)curl_multi_poll(multi, nullptr, 0, 50, nullptr);
+            }
+            ProbeOutcome outcome;
+            // URLs are examined in priority order, so the advertised XAddr wins
+            // over a guessed port exactly as it did when they were tried in turn.
+            for (auto& request : requests)
+            {
+                if (!request.curl) continue;
+                long status = 0;
+                curl_off_t connected = 0;
+                curl_easy_getinfo(request.curl, CURLINFO_RESPONSE_CODE, &status);
+                curl_easy_getinfo(request.curl, CURLINFO_CONNECT_TIME_T, &connected);
+                if (!outcome.candidate && request.finished)
+                {
+                    outcome.candidate = classify_probe(
+                        address, request.url, request.result, status, request.response_body
+                    );
+                }
+                // A timeout only proves absence when the full configured timeout
+                // ran; one the deadline shortened leaves the question open.
+                const bool timed_out = request.result == CURLE_OPERATION_TIMEDOUT;
+                if (!request.finished ||
+                    (timed_out && (connected == 0 ? request.connect_clipped : request.total_clipped)))
+                {
+                    outcome.complete = false;
+                }
+                curl_multi_remove_handle(multi, request.curl);
+                curl_easy_cleanup(request.curl);
+                curl_slist_free_all(request.headers);
+            }
+            curl_multi_cleanup(multi);
+            // Requests an abort left unfinished already cleared complete; a found
+            // device answers the question regardless of the other ports.
+            if (outcome.candidate) outcome.complete = true;
+            return outcome;
         }
 
-        void direct_probe(
+        /// Direct-probe coverage, recorded per address in probe order.
+        struct ProbeCoverage
+        {
+            std::vector<std::string> unchecked;
+            std::vector<std::string> incomplete;
+        };
+
+        ProbeCoverage direct_probe(
             const std::vector<std::string>& addresses,
             const NetworkDiscoveryOptions& options,
             const EndpointPolicy& policy,
@@ -900,6 +1065,7 @@ namespace wlonvif
                 std::string address;
                 std::optional<std::string> advertised_url;
             };
+            enum class Coverage { pending, complete, incomplete };
             std::vector<Target> targets;
             targets.reserve(addresses.size());
             for (const auto& address : addresses)
@@ -911,64 +1077,82 @@ namespace wlonvif
                                                     : discovered->second.device_service}
                 );
             }
+            std::vector<Coverage> coverage(targets.size(), Coverage::pending);
 
             std::atomic_size_t next{};
             std::atomic_size_t completed{};
             std::mutex output_mutex;
             const auto worker_count = std::min(options.maximum_concurrency, targets.size());
-            std::vector<std::jthread> workers;
-            workers.reserve(worker_count);
-            for (std::size_t worker = 0; worker < worker_count; ++worker)
             {
-                workers.emplace_back(
-                    [&]
-                    {
-                        for (;;)
+                std::vector<std::jthread> workers;
+                workers.reserve(worker_count);
+                for (std::size_t worker = 0; worker < worker_count; ++worker)
+                {
+                    workers.emplace_back(
+                        [&]
                         {
-                            const auto index = next.fetch_add(1);
-                            if (index >= targets.size() || cancellation.stop_requested() ||
-                                std::chrono::steady_clock::now() >= deadline)
+                            for (;;)
                             {
-                                return;
-                            }
-                            const auto& target = targets[index];
-                            {
+                                if (cancellation.stop_requested() ||
+                                    std::chrono::steady_clock::now() >= deadline)
+                                {
+                                    return;
+                                }
+                                const auto index = next.fetch_add(1);
+                                if (index >= targets.size())
+                                {
+                                    return;
+                                }
+                                const auto& target = targets[index];
+                                {
+                                    std::lock_guard lock(output_mutex);
+                                    report_progress(
+                                        options,
+                                        DiscoveryProgressStage::direct_probe,
+                                        completed.load(),
+                                        targets.size(),
+                                        target.address
+                                    );
+                                }
+                                auto outcome = probe_address(
+                                    target.address,
+                                    target.advertised_url,
+                                    options,
+                                    policy,
+                                    deadline,
+                                    cancellation
+                                );
+                                const auto count = completed.fetch_add(1) + 1;
                                 std::lock_guard lock(output_mutex);
+                                coverage[index] =
+                                    outcome.complete ? Coverage::complete : Coverage::incomplete;
+                                if (outcome.candidate)
+                                {
+                                    merge_candidate(
+                                        candidates, std::move(*outcome.candidate), options.maximum_results
+                                    );
+                                }
                                 report_progress(
                                     options,
                                     DiscoveryProgressStage::direct_probe,
-                                    completed.load(),
+                                    count,
                                     targets.size(),
                                     target.address
                                 );
                             }
-                            auto candidate = probe_address(
-                                target.address,
-                                target.advertised_url,
-                                options,
-                                policy,
-                                deadline,
-                                cancellation
-                            );
-                            const auto count = completed.fetch_add(1) + 1;
-                            std::lock_guard lock(output_mutex);
-                            if (candidate)
-                            {
-                                merge_candidate(
-                                    candidates, std::move(*candidate), options.maximum_results
-                                );
-                            }
-                            report_progress(
-                                options,
-                                DiscoveryProgressStage::direct_probe,
-                                count,
-                                targets.size(),
-                                target.address
-                            );
                         }
-                    }
-                );
+                    );
+                }
             }
+            ProbeCoverage output;
+            for (std::size_t index = 0; index < targets.size(); ++index)
+            {
+                if (coverage[index] == Coverage::pending)
+                    output.unchecked.push_back(targets[index].address);
+                else if (coverage[index] == Coverage::incomplete)
+                    output.incomplete.push_back(targets[index].address);
+            }
+            return output;
         }
     } // namespace
 
@@ -1016,14 +1200,14 @@ namespace wlonvif
         return output;
     }
 
-    Task<Result<std::vector<DeviceCandidate>>> discover_devices(
+    Task<Result<DiscoveryReport>> discover_network(
         std::shared_ptr<Runtime> runtime,
         std::shared_ptr<EndpointPolicy> endpoint_policy,
         NetworkDiscoveryOptions options,
         CallOptions call
     )
     {
-        return Task<Result<std::vector<DeviceCandidate>>>(
+        return Task<Result<DiscoveryReport>>(
             [runtime = std::move(runtime),
              endpoint_policy = std::move(endpoint_policy),
              options = std::move(options),
@@ -1036,7 +1220,7 @@ namespace wlonvif
                      call,
                      completion = std::move(completion)]() mutable
                     {
-                        Result<std::vector<DeviceCandidate>> result = Error{
+                        Result<DiscoveryReport> result = Error{
                             ErrorCategory::internal,
                             OperationId::discovery_probe,
                             "discovery did not complete"
@@ -1096,14 +1280,35 @@ namespace wlonvif
                                 scan_addresses.begin(),
                                 scan_addresses.end()
                             );
-                            auto unicast = ws_unicast_discover(
-                                discovery_options, call.deadline, call.cancellation, candidates
+                            auto unicast_authorized = authorize_unicast_discovery(
+                                discovery_options, call.deadline, call.cancellation
                             );
-                            if (!unicast) throw unicast.error();
+                            if (!unicast_authorized) throw unicast_authorized.error();
+                            // Unicast and multicast each wait a listen window, so they
+                            // overlap rather than consuming the deadline back to back.
+                            std::map<std::string, DeviceCandidate> unicast_candidates;
+                            std::jthread unicast(
+                                [&]
+                                {
+                                    ws_unicast_discover(
+                                        discovery_options,
+                                        call.deadline,
+                                        call.cancellation,
+                                        unicast_candidates
+                                    );
+                                }
+                            );
                             auto multicast = ws_discover(
                                 discovery_options, call.deadline, call.cancellation, candidates
                             );
+                            unicast.join();
                             if (!multicast) throw multicast.error();
+                            for (auto& [_, candidate] : unicast_candidates)
+                            {
+                                merge_candidate(
+                                    candidates, std::move(candidate), options.maximum_results
+                                );
+                            }
 
                             std::vector<std::string> addresses = options.targets;
                             addresses.insert(
@@ -1142,6 +1347,7 @@ namespace wlonvif
                             addresses.erase(
                                 std::unique(addresses.begin(), addresses.end()), addresses.end()
                             );
+                            ProbeCoverage coverage;
                             if (options.direct_probe && endpoint_policy)
                             {
                                 for (const auto& address : addresses)
@@ -1159,7 +1365,7 @@ namespace wlonvif
                                     }
                                 }
                                 detail::initialize_curl();
-                                direct_probe(
+                                coverage = direct_probe(
                                     addresses,
                                     options,
                                     *endpoint_policy,
@@ -1178,13 +1384,15 @@ namespace wlonvif
                             }
                             else
                             {
-                                std::vector<DeviceCandidate> output;
-                                output.reserve(candidates.size());
+                                DiscoveryReport report;
+                                report.devices.reserve(candidates.size());
                                 for (auto& [_, candidate] : candidates)
                                 {
-                                    output.push_back(std::move(candidate));
+                                    report.devices.push_back(std::move(candidate));
                                 }
-                                result = std::move(output);
+                                report.unchecked = std::move(coverage.unchecked);
+                                report.incomplete = std::move(coverage.incomplete);
+                                result = std::move(report);
                             }
                         }
                         catch (const Error& error)
@@ -1211,5 +1419,67 @@ namespace wlonvif
                 ).detach();
             }
         );
+    }
+
+    Task<Result<std::vector<DeviceCandidate>>> discover_devices(
+        std::shared_ptr<Runtime> runtime,
+        std::shared_ptr<EndpointPolicy> endpoint_policy,
+        NetworkDiscoveryOptions options,
+        CallOptions call
+    )
+    {
+        return Task<Result<std::vector<DeviceCandidate>>>(
+            [report = discover_network(
+                 std::move(runtime), std::move(endpoint_policy), std::move(options), call
+             )](auto completion) mutable
+            {
+                std::move(report).start(
+                    [completion = std::move(completion)](Result<DiscoveryReport> result) mutable
+                    {
+                        if (!result)
+                        {
+                            completion(result.error());
+                            return;
+                        }
+                        completion(std::move(result.value().devices));
+                    }
+                );
+            }
+        );
+    }
+
+    Result<std::chrono::milliseconds> discovery_time_bound(const NetworkDiscoveryOptions& options)
+    {
+        using std::chrono::milliseconds;
+        milliseconds bound{1000}; // Thread start-up, socket setup, and completion dispatch.
+        const bool unicast = !options.targets.empty() || !options.scan_networks.empty();
+        if (options.multicast || unicast)
+        {
+            // Unicast and every multicast interface listen concurrently; the
+            // multicast backoff between retransmissions is the longer of the two.
+            milliseconds backoff{};
+            for (std::size_t retry = 0; retry + 1 < options.retransmissions; ++retry)
+            {
+                backoff += options.initial_retry_delay *
+                           static_cast<int>(1U << std::min<std::size_t>(retry, 20));
+            }
+            bound += backoff + options.listen_duration;
+        }
+        if (options.direct_probe && options.maximum_concurrency > 0)
+        {
+            std::size_t addresses = options.targets.size();
+            if (!options.scan_networks.empty())
+            {
+                auto expanded = expand_networks(options.scan_networks, options.maximum_hosts);
+                if (!expanded) return expanded.error();
+                addresses += expanded.value().size();
+            }
+            // WS-Discovery may add responders outside the targets and ranges;
+            // allow one further round of probes for them.
+            const auto rounds =
+                (addresses + options.maximum_concurrency - 1) / options.maximum_concurrency + 1;
+            bound += options.request_timeout * static_cast<long>(rounds);
+        }
+        return bound;
     }
 } // namespace wlonvif

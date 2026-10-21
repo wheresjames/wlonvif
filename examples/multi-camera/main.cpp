@@ -1,4 +1,14 @@
-/** @file main.cpp @brief Inspect multiple cameras with bounded concurrency. */
+/**
+ * @file main.cpp
+ * @brief wlonvif-multi-camera: query many cameras at once, a few at a time.
+ *
+ *     wlonvif-multi-camera --ip 192.0.2.10 --ip 192.0.2.11 --url http://... --jobs 4
+ *
+ * Shows the pattern for fleets: one shared Runtime, a fixed number of worker
+ * threads taking the next camera from a shared counter, and one result row per
+ * camera, so a slow or broken camera delays only its own row. Every camera
+ * uses the same credentials.
+ */
 
 #include <atomic>
 #include <example_support.hpp>
@@ -21,12 +31,16 @@ namespace
         std::size_t profiles{};
         std::optional<wlonvif::Error> error;
     };
-}
+} // namespace
 
 int main(int argc, char** argv)
 {
     auto parsed = wlonvif::examples::parse_common_arguments(argc, argv);
-    if (!parsed) { std::cerr << parsed.error().message << '\n'; return 2; }
+    if (!parsed)
+    {
+        std::cerr << parsed.error().message << '\n';
+        return 2;
+    }
     auto common = std::move(parsed.value().common);
     std::vector<DeviceReference> devices;
     std::size_t jobs = 4;
@@ -49,18 +63,27 @@ int main(int argc, char** argv)
             return 2;
         }
         if (argument == "--url")
+        {
             devices.push_back({parsed.value().remaining[++index], {}});
+        }
         else if (argument == "--ip")
+        {
             devices.push_back({{}, parsed.value().remaining[++index]});
+        }
         else if (argument == "--jobs")
         {
-            if (!wlonvif::examples::parse_size(parsed.value().remaining[++index], jobs) || jobs > 32)
+            if (!wlonvif::examples::parse_size(parsed.value().remaining[++index], jobs) ||
+                jobs > 32)
             {
                 std::cerr << "Job count must be between 1 and 32\n";
                 return 2;
             }
         }
-        else { std::cerr << "Unknown argument: " << argument << '\n'; return 2; }
+        else
+        {
+            std::cerr << "Unknown argument: " << argument << '\n';
+            return 2;
+        }
     }
     if (devices.empty())
     {
@@ -68,10 +91,19 @@ int main(int argc, char** argv)
         return 2;
     }
     auto credentials = wlonvif::examples::load_credentials(common);
-    if (!credentials) { std::cerr << credentials.error().message << '\n'; return 2; }
+    if (!credentials)
+    {
+        std::cerr << credentials.error().message << '\n';
+        return 2;
+    }
     auto created = wlonvif::Runtime::create();
-    if (!created) { std::cerr << created.error().message << '\n'; return 1; }
+    if (!created)
+    {
+        std::cerr << created.error().message << '\n';
+        return 1;
+    }
     auto runtime = created.value();
+    // Rows are preallocated, so each worker writes only its own row without locking.
     std::vector<ResultRow> rows(devices.size());
     std::atomic_size_t next{};
     std::atomic_size_t complete{};
@@ -80,71 +112,98 @@ int main(int argc, char** argv)
     std::vector<std::jthread> workers;
     for (std::size_t worker = 0; worker < std::min(jobs, devices.size()); ++worker)
     {
-        workers.emplace_back([&]
-        {
-            for (;;)
+        workers.emplace_back(
+            [&]
             {
-                const auto index = next.fetch_add(1);
-                if (index >= devices.size()) return;
-                auto& row = rows[index];
-                const auto& reference = devices[index];
-                row.url = reference.url.empty() ? reference.address : reference.url;
-                auto endpoint = wlonvif::examples::resolve_device_endpoint(
-                    reference.url, reference.address, runtime, common.timeout_seconds
-                );
-                if (!endpoint) row.error = endpoint.error();
-                else
+                for (;;)
                 {
-                    row.url = std::move(endpoint.value().url);
-                    auto session = wlonvif::examples::connect_device(
-                        row.url, runtime, credentials.value(), common.timeout_seconds
-                    );
-                    if (!session)
+                    // Take the next camera nobody has started yet.
+                    const auto index = next.fetch_add(1);
+                    if (index >= devices.size())
                     {
-                        row.error = session.error();
+                        return;
+                    }
+                    auto& row = rows[index];
+                    const auto& reference = devices[index];
+                    row.url = reference.url.empty() ? reference.address : reference.url;
+                    auto endpoint = wlonvif::examples::resolve_device_endpoint(
+                        reference.url, reference.address, runtime, common.timeout_seconds
+                    );
+                    if (!endpoint)
+                    {
+                        row.error = endpoint.error();
                     }
                     else
                     {
-                        auto information = wlonvif::examples::wait_for_task(
-                            session.value()->get_device_information(
-                                wlonvif::examples::call_options(common.timeout_seconds)
-                            )
+                        row.url = std::move(endpoint.value().url);
+                        auto session = wlonvif::examples::connect_device(
+                            row.url, runtime, credentials.value(), common.timeout_seconds
                         );
-                        if (!information) row.error = information.error();
+                        if (!session)
+                        {
+                            row.error = session.error();
+                        }
                         else
                         {
-                            row.identity = information.value().manufacturer + " " +
-                                           information.value().model;
-                            auto media = session.value()->media();
-                            if (media)
+                            auto information = wlonvif::examples::wait_for_task(
+                                session.value()->get_device_information(
+                                    wlonvif::examples::call_options(common.timeout_seconds)
+                                )
+                            );
+                            if (!information)
                             {
-                                auto profiles = wlonvif::examples::wait_for_task(
-                                    media.value()->get_profiles(
-                                        wlonvif::examples::call_options(common.timeout_seconds)
-                                    )
-                                );
-                                if (profiles) row.profiles = profiles.value().size();
-                                else row.error = profiles.error();
+                                row.error = information.error();
                             }
-                            else row.error = media.error();
+                            else
+                            {
+                                row.identity = information.value().manufacturer + " " +
+                                               information.value().model;
+                                auto media = session.value()->media();
+                                if (media)
+                                {
+                                    auto profiles = wlonvif::examples::wait_for_task(
+                                        media.value()->get_profiles(
+                                            wlonvif::examples::call_options(common.timeout_seconds)
+                                        )
+                                    );
+                                    if (profiles)
+                                    {
+                                        row.profiles = profiles.value().size();
+                                    }
+                                    else
+                                    {
+                                        row.error = profiles.error();
+                                    }
+                                }
+                                else
+                                {
+                                    row.error = media.error();
+                                }
+                            }
                         }
                     }
-                }
-                const auto done = complete.fetch_add(1) + 1;
-                if (common.show_progress)
-                {
-                    std::lock_guard lock(progress_mutex);
-                    std::cerr << (terminal ? "\r" : "") << "Camera inspection " << done << '/'
-                              << rows.size() << "  " << wlonvif::examples::redact_url(row.url)
-                              << (terminal ? "\033[K" : "\n") << std::flush;
+                    const auto done = complete.fetch_add(1) + 1;
+                    if (common.show_progress)
+                    {
+                        std::lock_guard lock(progress_mutex);
+                        std::cerr << (terminal ? "\r" : "") << "Camera inspection " << done << '/'
+                                  << rows.size() << "  " << wlonvif::examples::redact_url(row.url)
+                                  << (terminal ? "\033[K" : "\n") << std::flush;
+                    }
                 }
             }
-        });
+        );
     }
     workers.clear();
-    if (common.show_progress && terminal) std::cerr << '\n';
+    if (common.show_progress && terminal)
+    {
+        std::cerr << '\n';
+    }
     std::size_t failures = 0;
-    if (common.json) std::cout << '[';
+    if (common.json)
+    {
+        std::cout << '[';
+    }
     for (std::size_t index = 0; index < rows.size(); ++index)
     {
         const auto& row = rows[index];
@@ -155,21 +214,32 @@ int main(int argc, char** argv)
                       << wlonvif::examples::json_escape(wlonvif::examples::redact_url(row.url))
                       << "\",\"identity\":\"" << wlonvif::examples::json_escape(row.identity)
                       << "\",\"profiles\":" << row.profiles;
-            if (row.error) std::cout << ",\"error\":\""
-                                     << wlonvif::examples::error_category_name(row.error->category)
-                                     << '"';
+            if (row.error)
+            {
+                std::cout << ",\"error\":\""
+                          << wlonvif::examples::error_category_name(row.error->category) << '"';
+            }
             std::cout << '}';
         }
         else
         {
             std::cout << wlonvif::examples::redact_url(row.url) << "  ";
-            if (row.error) std::cout << '[' << wlonvif::examples::error_category_name(row.error->category)
-                                     << "] " << row.error->message;
-            else std::cout << row.identity << "  profiles=" << row.profiles;
+            if (row.error)
+            {
+                std::cout << '[' << wlonvif::examples::error_category_name(row.error->category)
+                          << "] " << row.error->message;
+            }
+            else
+            {
+                std::cout << row.identity << "  profiles=" << row.profiles;
+            }
             std::cout << '\n';
         }
     }
-    if (common.json) std::cout << "]\n";
+    if (common.json)
+    {
+        std::cout << "]\n";
+    }
     (void)runtime->shutdown();
     return failures == rows.size() ? 1 : 0;
 }

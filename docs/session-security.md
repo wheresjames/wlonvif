@@ -10,12 +10,18 @@ resource-release backstop.
 | Current | Event | Result | Next |
 |---|---|---|---|
 | open | operation starts | operation is linked to session cancellation | open |
-| open | close starts | reject new work, cancel children, close provider | closing |
+| open | close starts | reject new work, cancel children, run the PTZ close sweep, then close provider | closing |
 | closing | operation starts | `closed_handle` | closing |
 | closing | final child is accounted | complete close waiters once | closed |
 | closing | caller cleanup budget expires | report `cleanup_complete=false`; accounting continues | closing |
 | closed | close starts | return the shared terminal result | closed |
 | closed | operation starts | `closed_handle` | closed |
+
+Session cancellation never applies to a PTZ Stop. The close sweep sends its Stops
+after cancelling the session's children, and those Stops authenticate with the
+session's credentials, so the credential provider is closed only after the sweep
+finishes. Cancellation tokens link transitively: linking an already linked token
+keeps every source it observed.
 
 ## Connection authorization
 
@@ -28,6 +34,8 @@ Endpoint policy and host permission are deliberately separate checks.
 
 The curl transport pins the approved address with `CURLOPT_RESOLVE`; curl therefore
 does not perform a second lookup or select an address outside the approved set.
+An IP-literal host (IPv4, or IPv6 without its URL brackets) is presented to the
+authorizer as its own single address and needs no pin, since it cannot be rebound.
 Every new request, redirect implementation, endpoint replacement, or reconnect is
 a new attempt and must receive a new opaque attempt ID. Redirect following is
 disabled in the default transport.
@@ -61,8 +69,13 @@ not inferred from arbitrary prose.
 
 ## PTZ movement ledger
 
-The session owns one entry per profile. Movement acceptance, entry replacement,
-Stop, status reconciliation, and the close sweep are serialized.
+The session owns one entry per profile. The ledger lock guards only ledger state
+and is never held across a network request, so a Stop is never queued behind an
+in-flight movement. Each entry records when it was accepted: a Stop removes only
+entries accepted before it was sent, status reconciliation removes only entries
+older than the status request, and a movement that lands after a Stop for its
+profile (or after close began) is stopped again. The close sweep first waits,
+within its budget, for in-flight movements to land.
 
 | Event | Existing entry | Resulting entry | Safety action |
 |---|---|---|---|
@@ -71,6 +84,7 @@ Stop, status reconciliation, and the close sweep are serialized.
 | move delivery uncertain | any | initiating movement | bounded Stop |
 | move rejected before delivery | any | unchanged | none |
 | move cancelled or timed out | any | retained if delivery may have occurred | bounded Stop |
+| move accepted after a concurrent Stop or after close began | any | initiating movement | bounded Stop |
 | successful applicable Stop | any | removed | complete |
 | authoritative stopped status | any | removed | none |
 | request completion without stopped proof | finite | finite | none |
@@ -87,6 +101,7 @@ non-idempotent and are never automatically retried.
 | HTTP 401 | `authentication` | HTTP status |
 | HTTP 403 | `authorization` | HTTP status |
 | HTTP 429 | `rate_limited` | HTTP status |
+| other non-2xx without a SOAP Fault | `protocol_violation` | HTTP status |
 | SOAP `ter:DeviceBusy` | `device_busy` | bounded SOAP fault |
 | SOAP `ter:RateLimit` or `ter:TooManyRequests` | `rate_limited` | bounded SOAP fault |
 | other SOAP Fault | `soap_fault` | bounded SOAP fault |

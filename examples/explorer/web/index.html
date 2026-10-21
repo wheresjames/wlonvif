@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>wlonvif explorer</title>
+    <link rel="stylesheet" href="/app.css" />
+    <!-- An ES module: deferred, strict, and loading the other modules it imports. -->
+    <script type="module" src="/js/main.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">◉</span> wlonvif <span class="muted">explorer</span>
+        <span id="version" class="muted small"></span>
+      </div>
+      <div class="scan">
+        <button id="scan-button" class="primary" type="button">Scan network</button>
+        <div id="scan-progress" class="scan-progress" hidden>
+          <div class="bar"><div id="scan-bar"></div></div>
+          <span id="scan-text" class="small"></span>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="add-button" type="button">Add camera</button>
+        <button id="log-button" type="button" aria-expanded="false">
+          Request log <span id="log-badge" class="badge bad" hidden></span>
+        </button>
+      </div>
+    </header>
+    <div class="layout">
+      <aside class="sidebar" aria-label="Cameras">
+        <div class="sidebar-head">
+          <strong>Cameras</strong> <span id="camera-count" class="muted small"></span>
+        </div>
+        <div id="scan-summary" class="scan-summary small" hidden></div>
+        <ul id="camera-list" class="camera-list"></ul>
+        <p id="camera-empty" class="empty small">
+          No cameras yet. Scan the network or add one by address.
+        </p>
+      </aside>
+      <main id="main" class="main">
+        <section id="welcome" class="welcome">
+          <h1>Check your camera with wlonvif</h1>
+          <p>
+            Find cameras on the network, sign in, and try every feature wlonvif offers: identity and
+            time, live video and recording, PTZ, imaging, analytics, events, and device settings.
+            The <em>Compatibility</em> tab runs every read-only check and produces a report you can
+            attach to a bug report.
+          </p>
+          <ol>
+            <li>
+              <strong>Scan network</strong> or <strong>Add camera</strong> by IP address or Device
+              service URL.
+            </li>
+            <li>Select a camera on the left and sign in.</li>
+            <li>
+              Explore the tabs. Every failure shows the camera's exact answer; the request log keeps
+              them all.
+            </li>
+          </ol>
+        </section>
+        <section id="camera" class="camera" hidden>
+          <div class="camera-head">
+            <div>
+              <h1 id="camera-title"></h1>
+              <div id="camera-subtitle" class="muted"></div>
+            </div>
+            <form id="login" class="login" autocomplete="off">
+              <input
+                id="login-user"
+                placeholder="Username"
+                aria-label="Username"
+                autocomplete="username"
+              />
+              <input
+                id="login-password"
+                type="password"
+                placeholder="Password"
+                aria-label="Password"
+                autocomplete="current-password"
+              />
+              <button class="primary" type="submit">Connect</button>
+              <span id="login-state" class="pill"></span>
+            </form>
+          </div>
+          <div id="camera-error"></div>
+          <nav id="tabs" class="tabs" role="tablist"></nav>
+          <div id="tab-content" class="tab-content"></div>
+        </section>
+      </main>
+    </div>
+    <section id="log-drawer" class="drawer" hidden aria-label="Request log">
+      <div class="drawer-head">
+        <strong>Request log</strong
+        ><span class="muted small"
+          >Every ONVIF exchange, newest first. Select a failure for details.</span
+        ><button id="log-clear" type="button">Clear view</button
+        ><button id="log-close" type="button">Close</button>
+      </div>
+      <div class="drawer-body">
+        <table class="log">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Camera</th>
+              <th>Operation</th>
+              <th>ms</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody id="log-rows"></tbody>
+        </table>
+      </div>
+    </section>
+    <dialog id="add-dialog">
+      <form method="dialog" id="add-form">
+        <h2>Add a camera</h2>
+        <label
+          >IP address or Device service URL<input
+            id="add-target"
+            required
+            placeholder="192.0.2.10 or http://192.0.2.10/onvif/device_service"
+        /></label>
+        <label>Username<input id="add-user" placeholder="optional" /></label>
+        <label
+          >Password<input id="add-password" type="password" autocomplete="new-password"
+        /></label>
+        <menu>
+          <button value="cancel" type="submit" formnovalidate>Cancel</button
+          ><button value="add" class="primary" type="submit">Add</button>
+        </menu>
+      </form>
+    </dialog>
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+  </body>
+</html>

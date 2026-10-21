@@ -1,3 +1,8 @@
+/**
+ * @file example_support_tests.cpp
+ * @brief Tests of the shared example helpers: size parsing, JSON escaping, and URL credentials.
+ */
+
 #include "example_support.hpp"
 
 #include <iostream>
@@ -20,8 +25,10 @@ int main()
     REQUIRE(size == 16);
     REQUIRE(!parse_size("16x", size));
     REQUIRE(json_escape("a\n\"b") == "a\\n\\\"b");
-    REQUIRE(redact_url("http://example-user:example-password@camera/path") ==
-            "http://[redacted]@camera/path");
+    REQUIRE(
+        redact_url("http://example-user:example-password@camera/path") ==
+        "http://[redacted]@camera/path"
+    );
     REQUIRE(redact_url("http://camera/path") == "http://camera/path");
 
     char executable[] = "example";
@@ -38,19 +45,22 @@ int main()
     REQUIRE(parsed.value().common.timeout_set);
     REQUIRE(parsed.value().common.password == password);
     REQUIRE(wlonvif::examples::shell_quote("a'b") == "'a'\\''b'");
-    REQUIRE(wlonvif::examples::redact_url(
-                "rtsp://example-user:example-password@camera/live"
-            ) ==
-            "rtsp://[redacted]@camera/live");
+    REQUIRE(
+        wlonvif::examples::redact_url("rtsp://example-user:example-password@camera/live") ==
+        "rtsp://[redacted]@camera/live"
+    );
     const std::optional<wlonvif::Credentials> url_credentials(
         wlonvif::Credentials{"example user", "example@password:with-punctuation", true}
     );
-    REQUIRE(url_with_credentials("rtsp://camera/live", url_credentials) ==
-            "rtsp://example%20user:example%40password%3Awith-punctuation@camera/live");
-    REQUIRE(url_with_credentials(
-                "rtsp://old-example-user:old-example-password@camera/live", url_credentials
-            ) ==
-            "rtsp://example%20user:example%40password%3Awith-punctuation@camera/live");
+    REQUIRE(
+        url_with_credentials("rtsp://camera/live", url_credentials) ==
+        "rtsp://example%20user:example%40password%3Awith-punctuation@camera/live"
+    );
+    REQUIRE(
+        url_with_credentials(
+            "rtsp://old-example-user:old-example-password@camera/live", url_credentials
+        ) == "rtsp://example%20user:example%40password%3Awith-punctuation@camera/live"
+    );
     REQUIRE(url_with_credentials("not-a-url", url_credentials) == "not-a-url");
     REQUIRE(parsed.value().common.json);
     REQUIRE(parsed.value().remaining == std::vector<std::string>{"--custom"});
@@ -66,9 +76,8 @@ int main()
 
     auto runtime = wlonvif::Runtime::create();
     REQUIRE(runtime);
-    auto explicit_endpoint = resolve_device_endpoint(
-        "http://camera:2020/onvif/device_service", {}, runtime.value(), 1
-    );
+    auto explicit_endpoint =
+        resolve_device_endpoint("http://camera:2020/onvif/device_service", {}, runtime.value(), 1);
     REQUIRE(explicit_endpoint);
     REQUIRE(explicit_endpoint.value().url == "http://camera:2020/onvif/device_service");
     REQUIRE(!resolve_device_endpoint({}, {}, runtime.value(), 1));

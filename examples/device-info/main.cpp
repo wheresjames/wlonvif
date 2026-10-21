@@ -1,4 +1,14 @@
-/** @file main.cpp @brief Query read-only information from a real ONVIF Device service. */
+/**
+ * @file main.cpp
+ * @brief wlonvif-device-info: read-only facts about a camera's Device service.
+ *
+ *     wlonvif-device-info --ip 192.0.2.10 --username admin [--identity --clock ...]
+ *
+ * The smallest complete example: find the Device service, connect, and make a
+ * few typed calls: identity, clock, scopes, advertised services, and the
+ * capability endpoints. Each section is printed as it arrives; with --json the
+ * sections form one object. Nothing on the camera is changed.
+ */
 
 #include <chrono>
 #include <ctime>
@@ -26,14 +36,15 @@ namespace
     void usage(const char* executable)
     {
         std::cout
-            << "Usage: " << executable << " (--url URL | --ip ADDRESS) [sections] [common options]\n\n"
+            << "Usage: " << executable
+            << " (--url URL | --ip ADDRESS) [sections] [common options]\n\n"
             << "Sections (default: --all):\n"
             << "  --identity --clock --scopes --services --capabilities --all\n\n"
             << "Common options:\n"
             << "  --timeout SECONDS --username NAME --password PASSWORD --password-file FILE\n"
             << "  --password-env NAME --allow-cleartext-basic --json --help\n";
     }
-}
+} // namespace
 
 int main(int argc, char** argv)
 {
@@ -62,12 +73,30 @@ int main(int argc, char** argv)
         {
             address = parsed.value().remaining[++index];
         }
-        else if (argument == "--identity") identity = true;
-        else if (argument == "--clock") clock = true;
-        else if (argument == "--scopes") scopes = true;
-        else if (argument == "--services") services = true;
-        else if (argument == "--capabilities") capabilities = true;
-        else if (argument == "--all") identity = clock = scopes = services = capabilities = true;
+        else if (argument == "--identity")
+        {
+            identity = true;
+        }
+        else if (argument == "--clock")
+        {
+            clock = true;
+        }
+        else if (argument == "--scopes")
+        {
+            scopes = true;
+        }
+        else if (argument == "--services")
+        {
+            services = true;
+        }
+        else if (argument == "--capabilities")
+        {
+            capabilities = true;
+        }
+        else if (argument == "--all")
+        {
+            identity = clock = scopes = services = capabilities = true;
+        }
         else
         {
             std::cerr << "Unknown or incomplete argument: " << argument << '\n';
@@ -96,9 +125,8 @@ int main(int argc, char** argv)
         return 1;
     }
     auto runtime = runtime_result.value();
-    auto endpoint = wlonvif::examples::resolve_device_endpoint(
-        url, address, runtime, common.timeout_seconds
-    );
+    auto endpoint =
+        wlonvif::examples::resolve_device_endpoint(url, address, runtime, common.timeout_seconds);
     if (!endpoint)
     {
         std::cerr << "Endpoint discovery failed: " << endpoint.error().message << '\n';
@@ -118,11 +146,18 @@ int main(int argc, char** argv)
         return 1;
     }
     auto device = connected.value();
+    // With --json, each section is one member of a single object, separated by commas.
     bool first = true;
-    if (common.json) std::cout << '{';
+    if (common.json)
+    {
+        std::cout << '{';
+    }
     const auto separator = [&]
     {
-        if (!first) std::cout << ',';
+        if (!first)
+        {
+            std::cout << ',';
+        }
         first = false;
     };
     const auto fail = [&](const wlonvif::Error& error)
@@ -137,7 +172,10 @@ int main(int argc, char** argv)
         auto result = wlonvif::examples::wait_for_task(
             device->get_device_information(wlonvif::examples::call_options(common.timeout_seconds))
         );
-        if (!result) return fail(result.error());
+        if (!result)
+        {
+            return fail(result.error());
+        }
         const auto& value = result.value();
         if (common.json)
         {
@@ -161,76 +199,148 @@ int main(int argc, char** argv)
     }
     if (clock)
     {
-        auto result = wlonvif::examples::wait_for_task(
-            device->get_system_date_and_time(wlonvif::examples::call_options(common.timeout_seconds))
-        );
-        if (!result) return fail(result.error());
+        auto result = wlonvif::examples::wait_for_task(device->get_system_date_and_time(
+            wlonvif::examples::call_options(common.timeout_seconds)
+        ));
+        if (!result)
+        {
+            return fail(result.error());
+        }
         const auto text = utc_text(result.value().utc);
-        if (common.json) { separator(); std::cout << "\"utc\":\"" << text << '"'; }
-        else std::cout << "UTC: " << text << '\n';
+        if (common.json)
+        {
+            separator();
+            std::cout << "\"utc\":\"" << text << '"';
+        }
+        else
+        {
+            std::cout << "UTC: " << text << '\n';
+        }
     }
     if (scopes)
     {
         auto result = wlonvif::examples::wait_for_task(
             device->get_scopes(wlonvif::examples::call_options(common.timeout_seconds))
         );
-        if (!result) return fail(result.error());
+        if (!result)
+        {
+            return fail(result.error());
+        }
         if (common.json)
         {
-            separator(); std::cout << "\"scopes\":[";
+            separator();
+            std::cout << "\"scopes\":[";
             for (std::size_t i = 0; i < result.value().size(); ++i)
+            {
                 std::cout << (i ? "," : "") << '"'
                           << wlonvif::examples::json_escape(result.value()[i]) << '"';
+            }
             std::cout << ']';
         }
-        else for (const auto& value : result.value()) std::cout << "Scope: " << value << '\n';
+        else
+        {
+            for (const auto& value : result.value())
+            {
+                std::cout << "Scope: " << value << '\n';
+            }
+        }
     }
     if (services)
     {
         auto result = wlonvif::examples::wait_for_task(
             device->get_services(wlonvif::examples::call_options(common.timeout_seconds))
         );
-        if (!result) return fail(result.error());
+        if (!result)
+        {
+            return fail(result.error());
+        }
         if (common.json)
         {
-            separator(); std::cout << "\"services\":[";
+            separator();
+            std::cout << "\"services\":[";
             for (std::size_t i = 0; i < result.value().size(); ++i)
             {
                 const auto& value = result.value()[i];
                 std::cout << (i ? "," : "") << "{\"namespace\":\""
                           << wlonvif::examples::json_escape(value.namespace_uri)
                           << "\",\"xaddr\":\""
-                          << wlonvif::examples::json_escape(wlonvif::examples::redact_url(value.xaddr))
+                          << wlonvif::examples::json_escape(
+                                 wlonvif::examples::redact_url(value.xaddr)
+                             )
                           << "\"}";
             }
             std::cout << ']';
         }
-        else for (const auto& value : result.value())
-            std::cout << "Service: " << value.namespace_uri << "\n  "
-                      << wlonvif::examples::redact_url(value.xaddr) << '\n';
+        else
+        {
+            for (const auto& value : result.value())
+            {
+                std::cout << "Service: " << value.namespace_uri << "\n  "
+                          << wlonvif::examples::redact_url(value.xaddr) << '\n';
+            }
+        }
     }
     if (capabilities)
     {
         auto result = wlonvif::examples::wait_for_task(
             device->get_capabilities(wlonvif::examples::call_options(common.timeout_seconds))
         );
-        if (!result) return fail(result.error());
+        if (!result)
+        {
+            return fail(result.error());
+        }
         const auto& value = result.value();
         if (common.json)
         {
-            separator(); std::cout << "\"capabilities\":{";
-            std::cout << "\"media\":" << (value.media_xaddr ? "\"" + wlonvif::examples::json_escape(wlonvif::examples::redact_url(*value.media_xaddr)) + "\"" : "null") << ',';
-            std::cout << "\"ptz\":" << (value.ptz_xaddr ? "\"" + wlonvif::examples::json_escape(wlonvif::examples::redact_url(*value.ptz_xaddr)) + "\"" : "null") << ',';
-            std::cout << "\"events\":" << (value.events_xaddr ? "\"" + wlonvif::examples::json_escape(wlonvif::examples::redact_url(*value.events_xaddr)) + "\"" : "null") << '}';
+            separator();
+            std::cout << "\"capabilities\":{";
+            std::cout << "\"media\":"
+                      << (value.media_xaddr
+                              ? "\"" +
+                                    wlonvif::examples::json_escape(
+                                        wlonvif::examples::redact_url(*value.media_xaddr)
+                                    ) +
+                                    "\""
+                              : "null")
+                      << ',';
+            std::cout << "\"ptz\":"
+                      << (value.ptz_xaddr ? "\"" +
+                                                wlonvif::examples::json_escape(
+                                                    wlonvif::examples::redact_url(*value.ptz_xaddr)
+                                                ) +
+                                                "\""
+                                          : "null")
+                      << ',';
+            std::cout << "\"events\":"
+                      << (value.events_xaddr
+                              ? "\"" +
+                                    wlonvif::examples::json_escape(
+                                        wlonvif::examples::redact_url(*value.events_xaddr)
+                                    ) +
+                                    "\""
+                              : "null")
+                      << '}';
         }
         else
         {
-            std::cout << "Media: " << (value.media_xaddr ? wlonvif::examples::redact_url(*value.media_xaddr) : "not advertised") << '\n';
-            std::cout << "PTZ: " << (value.ptz_xaddr ? wlonvif::examples::redact_url(*value.ptz_xaddr) : "not advertised") << '\n';
-            std::cout << "Events: " << (value.events_xaddr ? wlonvif::examples::redact_url(*value.events_xaddr) : "not advertised") << '\n';
+            std::cout << "Media: "
+                      << (value.media_xaddr ? wlonvif::examples::redact_url(*value.media_xaddr)
+                                            : "not advertised")
+                      << '\n';
+            std::cout << "PTZ: "
+                      << (value.ptz_xaddr ? wlonvif::examples::redact_url(*value.ptz_xaddr)
+                                          : "not advertised")
+                      << '\n';
+            std::cout << "Events: "
+                      << (value.events_xaddr ? wlonvif::examples::redact_url(*value.events_xaddr)
+                                             : "not advertised")
+                      << '\n';
         }
     }
-    if (common.json) std::cout << "}\n";
+    if (common.json)
+    {
+        std::cout << "}\n";
+    }
     (void)runtime->shutdown();
     return 0;
 }

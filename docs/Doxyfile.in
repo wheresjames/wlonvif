@@ -3,8 +3,11 @@ PROJECT_NUMBER         = "@PROJECT_VERSION@"
 PROJECT_BRIEF          = "C++20 ONVIF client and virtual-device library"
 OUTPUT_DIRECTORY       = "@WLONVIF_DOXYGEN_OUTPUT_DIR@"
 INPUT                  = "@CMAKE_CURRENT_SOURCE_DIR@/include" \
-                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/mainpage.dox"
-FILE_PATTERNS          = *.h *.hpp *.dox
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/mainpage.dox" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/session-security.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/ptz-control.md" \
+                         "@CMAKE_CURRENT_SOURCE_DIR@/docs/ptz-web.md"
+FILE_PATTERNS          = *.h *.hpp *.dox *.md
 RECURSIVE              = YES
 EXTRACT_ALL            = NO
 EXTRACT_PRIVATE        = NO

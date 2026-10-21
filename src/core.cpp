@@ -1,5 +1,8 @@
+#include <wlonvif/version.hpp>
 #include <wlonvif/wlonvif.hpp>
 #include <openssl/crypto.h>
+
+#include <algorithm>
 
 namespace wlonvif
 {
@@ -13,7 +16,12 @@ namespace wlonvif
         std::size_t next_shutdown_participant{1};
     };
 
-    std::string_view library_version() noexcept { return "0.1.0"; }
+    namespace
+    {
+        thread_local bool running_runtime_worker = false;
+    }
+
+    std::string_view library_version() noexcept { return WLONVIF_VERSION_STRING; }
     LibraryFeatures library_features() noexcept { return {}; }
     Runtime::Runtime() : state_(std::make_shared<State>())
     {
@@ -103,8 +111,13 @@ namespace wlonvif
         std::lock_guard lock(state->mutex);
         state->shutdown_participants.erase(identifier);
     }
+    bool Runtime::on_worker_thread() noexcept
+    {
+        return running_runtime_worker;
+    }
     void Runtime::run(std::shared_ptr<State> state)
     {
+        running_runtime_worker = true;
         for (;;)
         {
             std::function<void()> fn;
@@ -135,7 +148,10 @@ namespace wlonvif
     }
     bool CancellationToken::stop_requested() const noexcept
     {
-        return (state_ && state_->load()) || (other_ && other_->load());
+        return std::any_of(
+            states_.begin(), states_.end(),
+            [](const auto& state) { return state && state->load(); }
+        );
     }
 
     CredentialLease::CredentialLease(std::string username, std::string password, bool cleartext)

@@ -1,7 +1,22 @@
+/**
+ * @file ffmpeg_video_tests.cpp
+ * @brief Tests that the FFmpeg bridge reads whole JPEG frames from a child process,
+ * using ffmpeg_fake instead of a real FFmpeg.
+ */
+
 #include "ffmpeg_video.hpp"
+
 #include <iostream>
 using namespace wlonvif::examples::ptz_web;
-#define CHECK(x) do { if (!(x)) { std::cerr << "check failed: " #x << '\n'; return 1; } } while (0)
+#define CHECK(x)                                                                                   \
+    do                                                                                             \
+    {                                                                                              \
+        if (!(x))                                                                                  \
+        {                                                                                          \
+            std::cerr << "check failed: " #x << '\n';                                              \
+            return 1;                                                                              \
+        }                                                                                          \
+    } while (0)
 int main(int argc, char** argv)
 {
     CHECK(argc == 2);

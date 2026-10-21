@@ -1,3 +1,5 @@
+#include <string_view>
+#include <wlonvif/version.hpp>
 #include <wlonvif/wlonvif.hpp>
 
 int main()
@@ -9,7 +11,13 @@ int main()
     }
     auto provider = wlonvif::make_fixed_credential_provider({"user", "password"});
     const auto features = wlonvif::library_features();
-    if (wlonvif::library_version().empty() || !features.candidate_authorization ||
+    // PROJECT.txt, the installed version header, and the compiled library must agree.
+    if (wlonvif::library_version() != std::string_view{WLONVIF_EXPECTED_VERSION} ||
+        std::string_view{WLONVIF_VERSION_STRING} != WLONVIF_EXPECTED_VERSION)
+    {
+        return 3;
+    }
+    if ( !features.candidate_authorization ||
         !features.credential_providers || !features.deterministic_session_close ||
         !features.ptz_safety_ledger)
     {

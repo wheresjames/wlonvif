@@ -43,7 +43,10 @@ namespace wlonvif
         return b64(digest.data(), digest.size());
     }
     std::string soap_envelope(
-        OperationId op, std::string_view body, const std::optional<Credentials>& credentials
+        OperationId op,
+        std::string_view body,
+        const std::optional<Credentials>& credentials,
+        std::chrono::system_clock::duration clock_offset
     )
     {
         struct Operation
@@ -78,6 +81,53 @@ namespace wlonvif
             case OperationId::event_renew: operation = {"wsnt", "Renew"}; break;
             case OperationId::event_close: operation = {"wsnt", "Unsubscribe"}; break;
             case OperationId::discovery_probe: operation = {"tds", "Probe"}; break;
+            case OperationId::set_system_date_and_time:
+                operation = {"tds", "SetSystemDateAndTime"}; break;
+            case OperationId::get_ntp: operation = {"tds", "GetNTP"}; break;
+            case OperationId::set_ntp: operation = {"tds", "SetNTP"}; break;
+            case OperationId::set_scopes: operation = {"tds", "SetScopes"}; break;
+            case OperationId::add_scopes: operation = {"tds", "AddScopes"}; break;
+            case OperationId::remove_scopes: operation = {"tds", "RemoveScopes"}; break;
+            case OperationId::get_event_properties:
+                operation = {"tev", "GetEventProperties"}; break;
+            case OperationId::get_analytics_modules:
+                operation = {"tan", "GetAnalyticsModules"}; break;
+            case OperationId::modify_analytics_modules:
+                operation = {"tan", "ModifyAnalyticsModules"}; break;
+            case OperationId::get_analytics_rules: operation = {"tan", "GetRules"}; break;
+            case OperationId::modify_analytics_rules: operation = {"tan", "ModifyRules"}; break;
+            case OperationId::get_video_sources: operation = {"trt", "GetVideoSources"}; break;
+            case OperationId::get_imaging_settings:
+                operation = {"timg", "GetImagingSettings"}; break;
+            case OperationId::set_imaging_settings:
+                operation = {"timg", "SetImagingSettings"}; break;
+            case OperationId::get_imaging_options: operation = {"timg", "GetOptions"}; break;
+            case OperationId::get_video_encoder_options:
+                operation = {"trt", "GetVideoEncoderConfigurationOptions"}; break;
+            case OperationId::set_video_encoder_configuration:
+                operation = {"trt", "SetVideoEncoderConfiguration"}; break;
+            case OperationId::set_preset: operation = {"tptz", "SetPreset"}; break;
+            case OperationId::remove_preset: operation = {"tptz", "RemovePreset"}; break;
+            case OperationId::get_preset_tours: operation = {"tptz", "GetPresetTours"}; break;
+            case OperationId::create_preset_tour: operation = {"tptz", "CreatePresetTour"}; break;
+            case OperationId::modify_preset_tour: operation = {"tptz", "ModifyPresetTour"}; break;
+            case OperationId::operate_preset_tour: operation = {"tptz", "OperatePresetTour"}; break;
+            case OperationId::remove_preset_tour: operation = {"tptz", "RemovePresetTour"}; break;
+            case OperationId::get_ptz_configuration: operation = {"tptz", "GetConfiguration"}; break;
+            case OperationId::set_ptz_configuration: operation = {"tptz", "SetConfiguration"}; break;
+            case OperationId::get_hostname: operation = {"tds", "GetHostname"}; break;
+            case OperationId::set_hostname: operation = {"tds", "SetHostname"}; break;
+            case OperationId::get_network_interfaces:
+                operation = {"tds", "GetNetworkInterfaces"}; break;
+            case OperationId::get_dns: operation = {"tds", "GetDNS"}; break;
+            case OperationId::get_network_default_gateway:
+                operation = {"tds", "GetNetworkDefaultGateway"}; break;
+            case OperationId::get_network_protocols: operation = {"tds", "GetNetworkProtocols"}; break;
+            case OperationId::get_discovery_mode: operation = {"tds", "GetDiscoveryMode"}; break;
+            case OperationId::set_discovery_mode: operation = {"tds", "SetDiscoveryMode"}; break;
+            case OperationId::get_users: operation = {"tds", "GetUsers"}; break;
+            case OperationId::system_reboot: operation = {"tds", "SystemReboot"}; break;
+            case OperationId::custom: break;
         }
         std::string security;
         if (credentials)
@@ -89,8 +139,11 @@ namespace wlonvif
             {
                 throw std::runtime_error("secure random nonce unavailable");
             }
+            // Created is checked against the device's clock, not ours.
             const auto now = std::chrono::system_clock::to_time_t(
-                std::chrono::system_clock::now()
+                std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                    std::chrono::system_clock::now() + clock_offset
+                )
             );
             std::tm utc{};
 #ifdef _WIN32
@@ -120,29 +173,54 @@ namespace wlonvif
                "xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\" "
                "xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\" "
                "xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\" "
+               "xmlns:tan=\"http://www.onvif.org/ver20/analytics/wsdl\" "
+               "xmlns:timg=\"http://www.onvif.org/ver20/imaging/wsdl\" "
+               "xmlns:tns1=\"http://www.onvif.org/ver10/topics\" "
                "xmlns:tt=\"http://www.onvif.org/ver10/schema\" "
                "xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\" "
                "xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/"
                "oasis-200401-wss-wssecurity-utility-1.0.xsd\" "
                "xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/"
                "oasis-200401-wss-wssecurity-secext-1.0.xsd\"><s:Header>" +
-               security + "</s:Header><s:Body><" + std::string(operation.prefix) + ':' +
-               std::string(operation.name) + '>' + std::string(body) + "</" +
-               std::string(operation.prefix) + ':' + std::string(operation.name) +
-               "></s:Body></s:Envelope>";
+               security + "</s:Header><s:Body>" +
+               // A custom request's body is already the complete operation element.
+               (op == OperationId::custom
+                    ? std::string(body)
+                    : '<' + std::string(operation.prefix) + ':' + std::string(operation.name) + '>' +
+                          std::string(body) + "</" + std::string(operation.prefix) + ':' +
+                          std::string(operation.name) + '>') +
+               "</s:Body></s:Envelope>";
     }
     std::string soap_envelope(
-        OperationId operation, std::string_view body, const CredentialLease* credentials
+        OperationId operation,
+        std::string_view body,
+        const CredentialLease* credentials,
+        std::chrono::system_clock::duration clock_offset
     )
     {
         if (!credentials) return soap_envelope(operation, body, std::optional<Credentials>{});
-        Credentials materialized{
+        // Constructed in place and passed by reference: wrapping a named value in
+        // a temporary optional would make a second copy that is never cleansed.
+        std::optional<Credentials> materialized{
+            std::in_place,
             std::string(credentials->username()), std::string(credentials->password()),
             credentials->allow_cleartext_basic()
         };
-        auto envelope = soap_envelope(operation, body, std::optional<Credentials>{materialized});
-        OPENSSL_cleanse(materialized.username.data(), materialized.username.size());
-        OPENSSL_cleanse(materialized.password.data(), materialized.password.size());
-        return envelope;
+        const auto cleanse = [&]
+        {
+            OPENSSL_cleanse(materialized->username.data(), materialized->username.size());
+            OPENSSL_cleanse(materialized->password.data(), materialized->password.size());
+        };
+        try
+        {
+            auto envelope = soap_envelope(operation, body, materialized, clock_offset);
+            cleanse();
+            return envelope;
+        }
+        catch (...)
+        {
+            cleanse();
+            throw;
+        }
     }
 } // namespace wlonvif

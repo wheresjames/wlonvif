@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.24)
-project(wlonvif VERSION 0.1.0 LANGUAGES CXX)
+# Name, version, description, and homepage all come from PROJECT.txt.
+include(cmake/WlonvifVersion.cmake)
+project(wlonvif
+  VERSION ${WLONVIF_PROJECT_VERSION}
+  DESCRIPTION "${WLONVIF_PROJECT_DESCRIPTION}"
+  HOMEPAGE_URL "${WLONVIF_PROJECT_URL}"
+  LANGUAGES CXX)
 
 # Keep this file as the readable build map. Implementation details live in
 # purpose-specific modules; dependency discovery lives under cmake/deps.

@@ -1,10 +1,23 @@
+/**
+ * @file input_model_tests.cpp
+ * @brief Tests of the input rules: dead zone, inversion, precision, and the safety stops.
+ */
+
 #include "input_model.hpp"
 
 #include <cmath>
 #include <iostream>
 
 using namespace wlonvif::examples::ptz_control;
-#define CHECK(x) do { if (!(x)) { std::cerr << "check failed: " #x << " line " << __LINE__ << '\n'; return 1; } } while (0)
+#define CHECK(x)                                                                                   \
+    do                                                                                             \
+    {                                                                                              \
+        if (!(x))                                                                                  \
+        {                                                                                          \
+            std::cerr << "check failed: " #x << " line " << __LINE__ << '\n';                      \
+            return 1;                                                                              \
+        }                                                                                          \
+    } while (0)
 
 int main()
 {
@@ -19,7 +32,10 @@ int main()
     input.key(Key::right, true); // auto-repeat must not accumulate state
     const auto right = input.intent();
     CHECK(right.pan.value_or(0) > 0);
-    for (int i = 0; i < 10000; ++i) input.axes(0.01, -0.01, 0.01);
+    for (int i = 0; i < 10000; ++i)
+    {
+        input.axes(0.01, -0.01, 0.01);
+    }
     CHECK(input.intent().pan.value_or(0) > 0);
     input.key(Key::right, false);
     input.key(Key::left, true);
